@@ -28,6 +28,16 @@ ollama pull llama3.2
 
 The app talks to Ollama at `http://127.0.0.1:11434` using its native `/api/chat` endpoint. If a model is available, your messages get an **Assistant** reply automatically.
 
+### Tools
+
+The assistant can call a `get_time` tool when it needs the current time. It requests the tool as JSON:
+
+```json
+{"tool":"get_time"}
+```
+
+The app runs the tool locally, sends the result back to the model, and then the model answers the user (for example: "What time is it?").
+
 ### Other local options
 
 | Tool | Ease | Notes |
