@@ -1,23 +1,30 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::mpsc::Sender;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::{mpsc::{self, Sender}, OnceLock};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MODEL: &str = "llama3.2";
-const MAX_TOOL_ROUNDS: usize = 6;
+const MAX_TOOL_ROUNDS: usize = 8;
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
+const MAX_COMMAND_OUTPUT: usize = 8000;
+const KEEP_ALIVE: &str = "30m";
 
 const SYSTEM_PROMPT: &str = "\
 You are a helpful assistant in a chat app.
 
-You have two tools:
+You have three tools:
 - get_time: returns the current local date and time.
 - web_search: searches the web for up-to-date information.
+- run_command: runs a shell command on the user's machine. The user must approve \
+before it runs.
 
 If you need a tool, respond with ONLY a JSON object and nothing else:
 {\"tool\":\"get_time\"}
 {\"tool\":\"web_search\",\"query\":\"your search query\"}
+{\"tool\":\"run_command\",\"command\":\"the shell command\"}
 
 After you receive a tool result, answer the user in plain language.";
 
@@ -46,6 +53,14 @@ pub struct ChatTurn {
     pub content: String,
 }
 
+pub enum ChatProgressEvent {
+    Thinking(String),
+    CommandApprovalNeeded {
+        command: String,
+        response_tx: Sender<Result<String, String>>,
+    },
+}
+
 #[derive(Clone)]
 struct ToolInvocation {
     name: String,
@@ -58,18 +73,14 @@ struct ChatRequest {
     messages: Vec<Value>,
     stream: bool,
     tools: Vec<Value>,
-}
-
-#[derive(Serialize)]
-struct TavilySearchRequest<'a> {
-    query: &'a str,
-    max_results: u8,
-    include_answer: bool,
+    keep_alive: String,
 }
 
 #[derive(Deserialize)]
-struct ChatResponse {
+struct StreamChunk {
     message: ChatMessage,
+    #[serde(default)]
+    done: bool,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +89,13 @@ struct ChatMessage {
     content: String,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Serialize)]
+struct TavilySearchRequest<'a> {
+    query: &'a str,
+    max_results: u8,
+    include_answer: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -134,7 +152,7 @@ pub fn list_models(base_url: &str) -> Result<Vec<String>, String> {
 pub fn chat(
     config: &LlmConfig,
     messages: &[ChatTurn],
-    thinking_tx: &Sender<String>,
+    progress_tx: &Sender<ChatProgressEvent>,
 ) -> Result<String, String> {
     let mut api_messages = vec![json!({
         "role": "system",
@@ -150,33 +168,32 @@ pub fn chat(
     let mut thinking = String::from("Thinking…");
 
     for _ in 0..MAX_TOOL_ROUNDS {
-        send_thinking(thinking_tx, &thinking);
+        send_thinking(progress_tx, &thinking);
 
-        let response = send_chat_request(config, &api_messages)?;
-        let assistant = response.message;
+        let assistant = stream_chat_request(config, &api_messages, &thinking, progress_tx)?;
 
         if !assistant.content.trim().is_empty() {
             thinking.push_str("\n\n");
             thinking.push_str(assistant.content.trim());
-            send_thinking(thinking_tx, &thinking);
+            send_thinking(progress_tx, &thinking);
         }
 
         if let Some(invocation) = parse_tool_request(&assistant.content, &assistant.tool_calls) {
             thinking.push_str("\n\n→ Calling ");
             thinking.push_str(&invocation.name);
-            if invocation.name == "web_search" {
-                if let Some(query) = invocation.arguments.get("query").and_then(Value::as_str) {
-                    thinking.push_str(&format!(" ({query})"));
-                }
-            }
+            append_tool_preview(&mut thinking, &invocation);
             thinking.push('…');
-            send_thinking(thinking_tx, &thinking);
+            send_thinking(progress_tx, &thinking);
 
-            let result = execute_tool(&invocation, config)?;
+            let result = if invocation.name == "run_command" {
+                request_command_approval(&invocation, progress_tx, &mut thinking)?
+            } else {
+                execute_tool(&invocation, config)?
+            };
 
             thinking.push_str("\n\n← ");
             thinking.push_str(&summarize_tool_result(&invocation.name, &result));
-            send_thinking(thinking_tx, &thinking);
+            send_thinking(progress_tx, &thinking);
 
             if assistant.tool_calls.is_empty() {
                 api_messages.push(json!({
@@ -209,13 +226,115 @@ pub fn chat(
     Err("The model kept requesting tools without producing a final answer.".into())
 }
 
-fn send_thinking(thinking_tx: &Sender<String>, content: &str) {
-    let _ = thinking_tx.send(content.to_string());
+pub fn execute_shell_command(command: &str) -> Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("Command is empty.".into());
+    }
+
+    let output = run_shell(command)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut result = format!("Exit code: {}\n", output.status.code().unwrap_or(-1));
+    if !stdout.trim().is_empty() {
+        result.push_str("\nstdout:\n");
+        result.push_str(stdout.trim_end());
+        result.push('\n');
+    }
+    if !stderr.trim().is_empty() {
+        result.push_str("\nstderr:\n");
+        result.push_str(stderr.trim_end());
+        result.push('\n');
+    }
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        result.push_str("\n(no output)\n");
+    }
+
+    Ok(truncate(&result, MAX_COMMAND_OUTPUT))
+}
+
+fn request_command_approval(
+    invocation: &ToolInvocation,
+    progress_tx: &Sender<ChatProgressEvent>,
+    thinking: &mut String,
+) -> Result<String, String> {
+    let command = command_from_arguments(&invocation.arguments)?;
+
+    thinking.push_str("\n\n→ Requesting approval to run command:\n");
+    thinking.push_str(&command);
+    thinking.push_str("\n\n⏸ Waiting for your approval…");
+    send_thinking(progress_tx, thinking);
+
+    let (response_tx, response_rx) = mpsc::channel();
+    progress_tx
+        .send(ChatProgressEvent::CommandApprovalNeeded {
+            command,
+            response_tx,
+        })
+        .map_err(|_| "Could not request command approval.".to_string())?;
+
+    response_rx
+        .recv()
+        .map_err(|_| "Command approval channel closed.".to_string())?
+}
+
+fn command_from_arguments(arguments: &Value) -> Result<String, String> {
+    let parsed = normalize_arguments(arguments);
+    parsed
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
+        .ok_or("run_command requires a non-empty \"command\" argument.".into())
+}
+
+#[cfg(unix)]
+fn run_shell(command: &str) -> Result<std::process::Output, String> {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("Failed to run command: {err}"))
+}
+
+#[cfg(windows)]
+fn run_shell(command: &str) -> Result<std::process::Output, String> {
+    Command::new("cmd")
+        .args(["/C", command])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("Failed to run command: {err}"))
+}
+
+fn send_thinking(progress_tx: &Sender<ChatProgressEvent>, content: &str) {
+    let _ = progress_tx.send(ChatProgressEvent::Thinking(content.to_string()));
+}
+
+fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
+    match invocation.name.as_str() {
+        "web_search" => {
+            if let Some(query) = invocation.arguments.get("query").and_then(Value::as_str) {
+                thinking.push_str(&format!(" ({query})"));
+            }
+        }
+        "run_command" => {
+            if let Ok(command) = command_from_arguments(&invocation.arguments) {
+                thinking.push_str(&format!("\n  `$ {command}`"));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn summarize_tool_result(tool_name: &str, result: &str) -> String {
     match tool_name {
         "get_time" => format!("Current time: {result}"),
+        "run_command" => truncate(result, 600),
         "web_search" => truncate(result, 600),
         _ => truncate(result, 600),
     }
@@ -226,20 +345,30 @@ fn truncate(text: &str, max_len: usize) -> String {
         return text.to_string();
     }
 
-    let end = text.char_indices().nth(max_len).map(|(i, _)| i).unwrap_or(text.len());
+    let end = text
+        .char_indices()
+        .nth(max_len)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
     format!("{}…", &text[..end])
 }
 
-fn send_chat_request(config: &LlmConfig, messages: &[Value]) -> Result<ChatResponse, String> {
+fn stream_chat_request(
+    config: &LlmConfig,
+    messages: &[Value],
+    thinking_prefix: &str,
+    progress_tx: &Sender<ChatProgressEvent>,
+) -> Result<ChatMessage, String> {
     let url = format!("{}/api/chat", normalize_base_url(&config.base_url));
     let request = ChatRequest {
         model: config.model.clone(),
         messages: messages.to_vec(),
-        stream: false,
+        stream: true,
         tools: tool_definitions(),
+        keep_alive: KEEP_ALIVE.into(),
     };
 
-    let response = reqwest::blocking::Client::new()
+    let response = http_client()
         .post(url)
         .json(&request)
         .send()
@@ -249,7 +378,49 @@ fn send_chat_request(config: &LlmConfig, messages: &[Value]) -> Result<ChatRespo
         return Err(format!("Ollama returned HTTP {}", response.status()));
     }
 
-    response.json().map_err(|err| err.to_string())
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let reader = BufReader::new(response);
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("Could not read Ollama stream: {err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let chunk: StreamChunk =
+            serde_json::from_str(&line).map_err(|err| format!("Invalid Ollama stream chunk: {err}"))?;
+
+        if !chunk.message.content.is_empty() {
+            content.push_str(&chunk.message.content);
+            send_thinking(progress_tx, &format_streaming_thinking(thinking_prefix, &content));
+        }
+
+        if !chunk.message.tool_calls.is_empty() {
+            tool_calls = chunk.message.tool_calls;
+        }
+
+        if chunk.done {
+            if content.is_empty() && !chunk.message.content.is_empty() {
+                content = chunk.message.content;
+            }
+        }
+    }
+
+    Ok(ChatMessage { content, tool_calls })
+}
+
+fn format_streaming_thinking(prefix: &str, streamed: &str) -> String {
+    if prefix.trim().is_empty() {
+        streamed.to_string()
+    } else {
+        format!("{prefix}\n\n{streamed}")
+    }
+}
+
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::blocking::Client::new)
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -279,6 +450,23 @@ fn tool_definitions() -> Vec<Value> {
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a shell command on the user's machine. Requires user approval before execution.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to run"
+                        }
+                    },
+                    "required": ["command"]
                 }
             }
         }),
@@ -406,15 +594,25 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
         return None;
     }
 
-    let mut arguments = json!({});
-    if name == "web_search" {
-        let query = value
-            .get("query")
-            .or_else(|| value.pointer("/arguments/query"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        arguments = json!({ "query": query });
-    }
+    let arguments = match name {
+        "web_search" => {
+            let query = value
+                .get("query")
+                .or_else(|| value.pointer("/arguments/query"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({ "query": query })
+        }
+        "run_command" => {
+            let command = value
+                .get("command")
+                .or_else(|| value.pointer("/arguments/command"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({ "command": command })
+        }
+        _ => json!({}),
+    };
 
     Some(ToolInvocation {
         name: name.to_string(),
@@ -431,7 +629,7 @@ fn normalize_arguments(arguments: &Value) -> Value {
 }
 
 fn is_supported_tool(name: &str) -> bool {
-    matches!(name, "get_time" | "web_search")
+    matches!(name, "get_time" | "web_search" | "run_command")
 }
 
 fn json_candidates(text: &str) -> Vec<String> {
@@ -485,6 +683,17 @@ mod tests {
         assert_eq!(
             invocation.arguments.get("query").and_then(Value::as_str),
             Some("rust egui")
+        );
+    }
+
+    #[test]
+    fn parses_json_run_command_request() {
+        let request = parse_tool_request(r#"{"tool":"run_command","command":"ls -la"}"#, &[]);
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "run_command");
+        assert_eq!(
+            invocation.arguments.get("command").and_then(Value::as_str),
+            Some("ls -la")
         );
     }
 

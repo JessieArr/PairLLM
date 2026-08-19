@@ -36,8 +36,9 @@ The assistant can call tools when it needs extra information:
 |------|---------|--------------|
 | `get_time` | Current local time | `{"tool":"get_time"}` |
 | `web_search` | Web search via [Tavily](https://tavily.com) | `{"tool":"web_search","query":"your search"}` |
+| `run_command` | Run a shell command (requires approval) | `{"tool":"run_command","command":"ls -la"}` |
 
-The app runs the tool locally (or calls Tavily), sends the result back to the model, and then the model answers the user.
+The app runs tools locally (or calls Tavily), sends the result back to the model, and then the model answers the user. **CLI commands are never run automatically** — you must approve them in a confirmation dialog first.
 
 #### Tavily setup
 

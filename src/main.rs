@@ -2,7 +2,7 @@ mod llm;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
-use llm::{ChatTurn, LlmConfig};
+use llm::{ChatProgressEvent, ChatTurn, LlmConfig};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -36,9 +36,18 @@ struct Message {
     is_thinking: bool,
 }
 
+struct CommandPrompt {
+    command: String,
+    response_tx: Sender<Result<String, String>>,
+}
+
 enum LlmEvent {
     Models { models: Vec<String> },
     Thinking { content: String },
+    CommandApprovalNeeded {
+        command: String,
+        response_tx: Sender<Result<String, String>>,
+    },
     Reply { content: String },
     Failed { message: String },
 }
@@ -53,6 +62,7 @@ struct ChatApp {
     llm_status: String,
     llm_busy: bool,
     thinking_message_index: Option<usize>,
+    command_prompt: Option<CommandPrompt>,
     llm_tx: Sender<LlmEvent>,
     llm_rx: Receiver<LlmEvent>,
 }
@@ -70,6 +80,7 @@ impl ChatApp {
             llm_status: "Checking for Ollama…".into(),
             llm_busy: false,
             thinking_message_index: None,
+            command_prompt: None,
             llm_tx,
             llm_rx,
         };
@@ -153,16 +164,29 @@ impl ChatApp {
             .collect::<Vec<_>>();
 
         thread::spawn(move || {
-            let (thinking_tx, thinking_rx) = mpsc::channel();
-            let progress_tx = tx.clone();
+            let (progress_tx, progress_rx) = mpsc::channel();
+            let event_tx = tx.clone();
             let progress_handle = thread::spawn(move || {
-                while let Ok(content) = thinking_rx.recv() {
-                    let _ = progress_tx.send(LlmEvent::Thinking { content });
+                while let Ok(event) = progress_rx.recv() {
+                    match event {
+                        ChatProgressEvent::Thinking(content) => {
+                            let _ = event_tx.send(LlmEvent::Thinking { content });
+                        }
+                        ChatProgressEvent::CommandApprovalNeeded {
+                            command,
+                            response_tx,
+                        } => {
+                            let _ = event_tx.send(LlmEvent::CommandApprovalNeeded {
+                                command,
+                                response_tx,
+                            });
+                        }
+                    }
                 }
             });
 
-            let result = llm::chat(&config, &turns, &thinking_tx);
-            drop(thinking_tx);
+            let result = llm::chat(&config, &turns, &progress_tx);
+            drop(progress_tx);
             progress_handle.join().ok();
 
             match result {
@@ -174,6 +198,25 @@ impl ChatApp {
                 }
             }
         });
+    }
+
+    fn approve_command(&mut self) {
+        let Some(prompt) = self.command_prompt.take() else {
+            return;
+        };
+
+        thread::spawn(move || {
+            let result = llm::execute_shell_command(&prompt.command);
+            let _ = prompt.response_tx.send(result);
+        });
+    }
+
+    fn reject_command(&mut self) {
+        if let Some(prompt) = self.command_prompt.take() {
+            let _ = prompt
+                .response_tx
+                .send(Ok("User rejected running this command.".into()));
+        }
     }
 
     fn remove_thinking_message(&mut self) {
@@ -206,6 +249,15 @@ impl ChatApp {
                         }
                     }
                 }
+                LlmEvent::CommandApprovalNeeded {
+                    command,
+                    response_tx,
+                } => {
+                    self.command_prompt = Some(CommandPrompt {
+                        command,
+                        response_tx,
+                    });
+                }
                 LlmEvent::Reply { content } => {
                     if let Some(index) = self.thinking_message_index.take() {
                         if let Some(message) = self.messages.get_mut(index) {
@@ -230,6 +282,7 @@ impl ChatApp {
                         self.remove_thinking_message();
                         self.llm_busy = false;
                     }
+                    self.command_prompt = None;
                     self.llm_status = message.clone();
                     self.status = Some(message);
                 }
@@ -242,6 +295,7 @@ impl ChatApp {
 impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_llm_events(ctx);
+        self.show_command_prompt(ctx);
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(8.0);
@@ -295,7 +349,7 @@ impl eframe::App for ChatApp {
                 ui.label(
                     egui::RichText::new(
                         "Recommended: install Ollama, run `ollama pull llama3.2`, then Refresh. \
-                         For web search, add a Tavily key from tavily.com.",
+                         CLI commands require your approval before running.",
                     )
                     .weak()
                     .small(),
@@ -308,9 +362,11 @@ impl eframe::App for ChatApp {
         egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
             ui.add_space(8.0);
 
+            let composer_enabled = !self.llm_busy && self.command_prompt.is_none();
+
             ui.horizontal(|ui| {
                 let response = ui.add_enabled(
-                    !self.llm_busy,
+                    composer_enabled,
                     egui::TextEdit::multiline(&mut self.draft)
                         .desired_width(f32::INFINITY)
                         .desired_rows(3)
@@ -318,7 +374,7 @@ impl eframe::App for ChatApp {
                 );
 
                 let send_clicked = ui
-                    .add_enabled(!self.llm_busy, egui::Button::new("Send"))
+                    .add_enabled(composer_enabled, egui::Button::new("Send"))
                     .clicked();
 
                 let enter_pressed = response.has_focus()
@@ -432,5 +488,55 @@ impl eframe::App for ChatApp {
                     }
                 });
         });
+    }
+}
+
+impl ChatApp {
+    fn show_command_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.command_prompt.as_ref() else {
+            return;
+        };
+
+        let command = prompt.command.clone();
+
+        egui::Window::new("Approve command")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("The assistant wants to run this shell command:");
+                ui.add_space(8.0);
+
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(15, 18, 26))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(255, 196, 96),
+                    ))
+                    .inner_margin(12.0)
+                    .corner_radius(8.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(format!("$ {command}")).monospace());
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Only approve commands you trust.")
+                        .weak()
+                        .small(),
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reject").clicked() {
+                        self.reject_command();
+                    }
+
+                    if ui.button("Run command").clicked() {
+                        self.approve_command();
+                    }
+                });
+            });
     }
 }
