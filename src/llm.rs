@@ -1,16 +1,20 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc::{self, Sender}, OnceLock};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
-const DEFAULT_MODEL: &str = "llama3.2";
+const DEFAULT_MODEL: &str = "qwen3:4b";
 const DEFAULT_NUM_CTX: u32 = 16384;
 const MAX_TOOL_ROUNDS: usize = 8;
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_COMMAND_OUTPUT: usize = 8000;
+const MAX_READ_FILE_CHARS: usize = 8000;
+const MAX_LIST_ENTRIES: usize = 500;
 const MAX_TOOL_RESULT_CHARS: usize = 4000;
 const MAX_CONTEXT_MESSAGES: usize = 20;
 const MAX_CONTEXT_MESSAGE_CHARS: usize = 3000;
@@ -19,20 +23,57 @@ const KEEP_ALIVE: &str = "30m";
 const SYSTEM_PROMPT: &str = "\
 You are a helpful assistant in a chat app.
 
-You have three tools:
-- get_time: returns the current local date and time.
+You have five tools:
 - web_search: searches the web for up-to-date information.
+- list_files: lists files and directories at a path (like ls).
+- read_file: reads the contents of a file.
+- replace_in_file: replaces a range of lines in a file with new text (1-based, inclusive).
 - run_command: runs a shell command on the user's machine. The user must approve \
 before it runs.
 
 If you need a tool, respond with ONLY a JSON object and nothing else:
-{\"tool\":\"get_time\"}
 {\"tool\":\"web_search\",\"query\":\"your search query\"}
+{\"tool\":\"list_files\",\"path\":\"/path/to/dir\"}
+{\"tool\":\"read_file\",\"path\":\"/path/to/file\"}
+{\"tool\":\"replace_in_file\",\"path\":\"/path/to/file\",\"start_line\":1,\"end_line\":3,\"text\":\"new content\"}
 {\"tool\":\"run_command\",\"command\":\"the shell command\"}
 
 After you receive a tool result, answer the user in plain language.";
 
-#[derive(Clone)]
+fn system_prompt() -> String {
+    let now = Local::now()
+        .format("%A, %B %d, %Y at %I:%M %p %Z")
+        .to_string();
+    format!("Current time: {now}\n\n{SYSTEM_PROMPT}")
+}
+
+pub struct QwenModelOption {
+    pub label: &'static str,
+    pub tag: &'static str,
+}
+
+pub const QWEN_MODEL_OPTIONS: &[QwenModelOption] = &[
+    QwenModelOption {
+        label: "Qwen3 0.6B",
+        tag: "qwen3:0.6b",
+    },
+    QwenModelOption {
+        label: "Qwen3 1.7B",
+        tag: "qwen3:1.7b",
+    },
+    QwenModelOption {
+        label: "Qwen3 4B",
+        tag: "qwen3:4b",
+    },
+];
+
+pub fn qwen_model_index(model: &str) -> Option<usize> {
+    QWEN_MODEL_OPTIONS
+        .iter()
+        .position(|option| option.tag == model)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub enabled: bool,
     pub base_url: String,
@@ -148,6 +189,18 @@ impl OllamaMetrics {
 pub struct ChatResult {
     pub content: String,
     pub metrics: OllamaMetrics,
+    pub trace: ChatTrace,
+}
+
+#[derive(Clone, Default)]
+pub struct ChatTrace {
+    pub rounds: Vec<ChatRoundTrace>,
+}
+
+#[derive(Clone)]
+pub struct ChatRoundTrace {
+    pub request: Value,
+    pub response: Value,
 }
 
 fn tokens_per_second(token_count: u64, duration_ns: u64) -> f64 {
@@ -293,7 +346,7 @@ pub fn chat(
 
     let mut api_messages = vec![json!({
         "role": "system",
-        "content": SYSTEM_PROMPT,
+        "content": system_prompt(),
     })];
     api_messages.extend(messages.iter().map(|turn| {
         json!({
@@ -304,13 +357,23 @@ pub fn chat(
 
     let mut thinking = String::from("Thinking…");
     let mut metrics = OllamaMetrics::default();
+    let mut trace = ChatTrace::default();
 
     for _ in 0..MAX_TOOL_ROUNDS {
         send_thinking(progress_tx, &thinking);
 
+        let request = build_chat_request(config, &api_messages);
+        let request_value =
+            serde_json::to_value(&request).unwrap_or_else(|_| Value::String("<request>".into()));
+
         let response = stream_chat_request(config, &api_messages, &thinking, progress_tx)?;
         metrics.merge(&response.metrics);
         let assistant = response.message;
+
+        trace.rounds.push(ChatRoundTrace {
+            request: request_value,
+            response: trace_response_value(&assistant, &response.metrics),
+        });
 
         if !assistant.content.trim().is_empty() {
             thinking.push_str("\n\n");
@@ -363,6 +426,7 @@ pub fn chat(
         return Ok(ChatResult {
             content: assistant.content,
             metrics,
+            trace,
         });
     }
 
@@ -465,6 +529,21 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
                 thinking.push_str(&format!(" ({query})"));
             }
         }
+        "list_files" | "read_file" => {
+            if let Ok(path) = path_from_arguments(&invocation.arguments) {
+                thinking.push_str(&format!(" ({})", path.display()));
+            }
+        }
+        "replace_in_file" => {
+            if let Ok(path) = path_from_arguments(&invocation.arguments) {
+                let start = invocation.arguments.get("start_line");
+                let end = invocation.arguments.get("end_line");
+                thinking.push_str(&format!(
+                    " ({path} lines {start:?}-{end:?})",
+                    path = path.display()
+                ));
+            }
+        }
         "run_command" => {
             if let Ok(command) = command_from_arguments(&invocation.arguments) {
                 thinking.push_str(&format!("\n  `$ {command}`"));
@@ -476,9 +555,8 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
 
 fn summarize_tool_result(tool_name: &str, result: &str) -> String {
     match tool_name {
-        "get_time" => format!("Current time: {result}"),
-        "run_command" => truncate(result, 600),
-        "web_search" => truncate(result, 600),
+        "read_file" | "list_files" | "run_command" | "web_search" => truncate(result, 600),
+        "replace_in_file" => result.to_string(),
         _ => truncate(result, 600),
     }
 }
@@ -507,14 +585,8 @@ fn trim_context_messages(messages: &[ChatTurn]) -> Vec<ChatTurn> {
         .collect()
 }
 
-fn stream_chat_request(
-    config: &LlmConfig,
-    messages: &[Value],
-    thinking_prefix: &str,
-    progress_tx: &Sender<ChatProgressEvent>,
-) -> Result<StreamChatResult, String> {
-    let url = format!("{}/api/chat", normalize_base_url(&config.base_url));
-    let request = ChatRequest {
+fn build_chat_request(config: &LlmConfig, messages: &[Value]) -> ChatRequest {
+    ChatRequest {
         model: config.model.clone(),
         messages: messages.to_vec(),
         stream: true,
@@ -524,7 +596,36 @@ fn stream_chat_request(
         options: ModelOptions {
             num_ctx: config.num_ctx,
         },
-    };
+    }
+}
+
+fn trace_response_value(message: &ChatMessage, metrics: &OllamaMetrics) -> Value {
+    json!({
+        "message": {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": message.tool_calls,
+        },
+        "usage": {
+            "total_duration_ns": metrics.total_duration_ns,
+            "load_duration_ns": metrics.load_duration_ns,
+            "prompt_eval_count": metrics.prompt_eval_count,
+            "prompt_eval_duration_ns": metrics.prompt_eval_duration_ns,
+            "eval_count": metrics.eval_count,
+            "eval_duration_ns": metrics.eval_duration_ns,
+        },
+        "http_headers": metrics.http_headers,
+    })
+}
+
+fn stream_chat_request(
+    config: &LlmConfig,
+    messages: &[Value],
+    thinking_prefix: &str,
+    progress_tx: &Sender<ChatProgressEvent>,
+) -> Result<StreamChatResult, String> {
+    let url = format!("{}/api/chat", normalize_base_url(&config.base_url));
+    let request = build_chat_request(config, messages);
 
     let response = http_client()
         .post(url)
@@ -612,17 +713,6 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "get_time",
-                "description": "Get the current local date and time",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
                 "name": "web_search",
                 "description": "Search the web for current information using Tavily",
                 "parameters": {
@@ -634,6 +724,69 @@ fn tool_definitions() -> Vec<Value> {
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files and directories at a path, similar to ls",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to list"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a text file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path to read"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "replace_in_file",
+                "description": "Replace a range of lines in a file with new text. Line numbers are 1-based and inclusive.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path to modify"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "First line to replace (1-based, inclusive)"
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "Last line to replace (1-based, inclusive)"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Replacement text (may span multiple lines)"
+                        }
+                    },
+                    "required": ["path", "start_line", "end_line", "text"]
                 }
             }
         }),
@@ -659,16 +812,188 @@ fn tool_definitions() -> Vec<Value> {
 
 fn execute_tool(invocation: &ToolInvocation, config: &LlmConfig) -> Result<String, String> {
     match invocation.name.as_str() {
-        "get_time" => Ok(get_time()),
         "web_search" => web_search(config, &invocation.arguments),
+        "list_files" => list_files(&invocation.arguments),
+        "read_file" => read_file(&invocation.arguments),
+        "replace_in_file" => replace_in_file(&invocation.arguments),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
 
-fn get_time() -> String {
-    Local::now()
-        .format("%A, %B %d, %Y at %I:%M %p %Z")
-        .to_string()
+fn path_from_arguments(arguments: &Value) -> Result<PathBuf, String> {
+    let parsed = normalize_arguments(arguments);
+    let path = parsed
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or("A non-empty \"path\" argument is required.")?;
+    expand_path(path)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
+}
+
+fn expand_path(path: &str) -> Result<PathBuf, String> {
+    if path == "~" {
+        return home_dir().ok_or_else(|| "Could not resolve home directory.".to_string());
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = home_dir().ok_or_else(|| "Could not resolve home directory.".to_string())?;
+        return Ok(home.join(rest));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+fn usize_from_value(value: &Value, field: &str) -> Result<usize, String> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("\"{field}\" must be a positive integer.")),
+        Value::String(text) => text
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| format!("\"{field}\" must be a positive integer.")),
+        _ => Err(format!("\"{field}\" must be a positive integer.")),
+    }
+}
+
+fn list_files(arguments: &Value) -> Result<String, String> {
+    let path = path_from_arguments(arguments)?;
+    let entries = fs::read_dir(&path)
+        .map_err(|err| format!("Could not list {}: {err}", path.display()))?;
+
+    let mut lines = vec![format!("Listing {}:", path.display())];
+    let mut count = 0;
+
+    for entry in entries {
+        if count >= MAX_LIST_ENTRIES {
+            lines.push(format!("… truncated after {MAX_LIST_ENTRIES} entries"));
+            break;
+        }
+
+        let entry = entry.map_err(|err| format!("Could not read directory entry: {err}"))?;
+        let file_type = entry.file_type().map_err(|err| err.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = if file_type.is_dir() {
+            "DIR"
+        } else if file_type.is_symlink() {
+            "LINK"
+        } else {
+            "FILE"
+        };
+
+        let detail = if file_type.is_file() {
+            entry
+                .metadata()
+                .ok()
+                .map(|meta| format!("{} bytes", meta.len()))
+                .unwrap_or_else(|| "unknown size".into())
+        } else {
+            String::new()
+        };
+
+        if detail.is_empty() {
+            lines.push(format!("  [{kind}]  {name}"));
+        } else {
+            lines.push(format!("  [{kind}]  {name} ({detail})"));
+        }
+
+        count += 1;
+    }
+
+    if count == 0 {
+        lines.push("  (empty directory)".into());
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn read_file(arguments: &Value) -> Result<String, String> {
+    let path = path_from_arguments(arguments)?;
+
+    if !path.is_file() {
+        return Err(format!("Not a file: {}", path.display()));
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+
+    if content.chars().count() > MAX_READ_FILE_CHARS {
+        Ok(format!(
+            "{}\n\n… truncated (file exceeds {MAX_READ_FILE_CHARS} characters)",
+            truncate(&content, MAX_READ_FILE_CHARS)
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
+fn replace_in_file(arguments: &Value) -> Result<String, String> {
+    let parsed = normalize_arguments(arguments);
+    let path = path_from_arguments(&parsed)?;
+    let start_line = parsed
+        .get("start_line")
+        .ok_or("replace_in_file requires \"start_line\".")?;
+    let end_line = parsed
+        .get("end_line")
+        .ok_or("replace_in_file requires \"end_line\".")?;
+    let start_line = usize_from_value(start_line, "start_line")?;
+    let end_line = usize_from_value(end_line, "end_line")?;
+
+    if start_line > end_line {
+        return Err("start_line must be less than or equal to end_line.".into());
+    }
+
+    let text = parsed
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("replace_in_file requires \"text\".")?;
+
+    if !path.is_file() {
+        return Err(format!("Not a file: {}", path.display()));
+    }
+
+    let original = fs::read_to_string(&path)
+        .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    let trailing_newline = original.ends_with('\n');
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+
+    if start_line > lines.len() {
+        return Err(format!(
+            "start_line {start_line} is beyond end of file ({} lines).",
+            lines.len()
+        ));
+    }
+
+    let end_index = end_line.min(lines.len());
+    let removed = end_index - start_line + 1;
+    let replacement: Vec<String> = text.lines().map(str::to_string).collect();
+    let inserted = replacement.len();
+    lines.splice((start_line - 1)..end_index, replacement);
+
+    let mut updated = lines.join("\n");
+    if trailing_newline && !updated.is_empty() {
+        updated.push('\n');
+    }
+
+    fs::write(&path, &updated)
+        .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
+
+    Ok(format!(
+        "Replaced lines {start_line}-{end_line} in {} ({removed} line(s) -> {inserted} line(s)).",
+        path.display()
+    ))
 }
 
 fn web_search(config: &LlmConfig, arguments: &Value) -> Result<String, String> {
@@ -795,6 +1120,22 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
                 .unwrap_or(Value::Null);
             json!({ "command": command })
         }
+        "list_files" | "read_file" => {
+            let path = value
+                .get("path")
+                .or_else(|| value.pointer("/arguments/path"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({ "path": path })
+        }
+        "replace_in_file" => {
+            json!({
+                "path": value.get("path").or_else(|| value.pointer("/arguments/path")).cloned().unwrap_or(Value::Null),
+                "start_line": value.get("start_line").or_else(|| value.pointer("/arguments/start_line")).cloned().unwrap_or(Value::Null),
+                "end_line": value.get("end_line").or_else(|| value.pointer("/arguments/end_line")).cloned().unwrap_or(Value::Null),
+                "text": value.get("text").or_else(|| value.pointer("/arguments/text")).cloned().unwrap_or(Value::Null),
+            })
+        }
         _ => json!({}),
     };
 
@@ -813,7 +1154,10 @@ fn normalize_arguments(arguments: &Value) -> Value {
 }
 
 fn is_supported_tool(name: &str) -> bool {
-    matches!(name, "get_time" | "web_search" | "run_command")
+    matches!(
+        name,
+        "web_search" | "list_files" | "read_file" | "replace_in_file" | "run_command"
+    )
 }
 
 fn json_candidates(text: &str) -> Vec<String> {
@@ -887,9 +1231,79 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_get_time_request() {
-        let request = parse_tool_request(r#"{"tool":"get_time"}"#, &[]);
-        assert_eq!(request.as_ref().map(|r| r.name.as_str()), Some("get_time"));
+    fn parses_json_list_files_request() {
+        let request = parse_tool_request(r#"{"tool":"list_files","path":"."}"#, &[]);
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "list_files");
+        assert_eq!(
+            invocation.arguments.get("path").and_then(Value::as_str),
+            Some(".")
+        );
+    }
+
+    #[test]
+    fn parses_json_read_file_request() {
+        let request = parse_tool_request(r#"{"tool":"read_file","path":"README.md"}"#, &[]);
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "read_file");
+        assert_eq!(
+            invocation.arguments.get("path").and_then(Value::as_str),
+            Some("README.md")
+        );
+    }
+
+    #[test]
+    fn parses_json_replace_in_file_request() {
+        let request = parse_tool_request(
+            r#"{"tool":"replace_in_file","path":"src/main.rs","start_line":1,"end_line":2,"text":"fn main() {}"}"#,
+            &[],
+        );
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "replace_in_file");
+        assert_eq!(
+            invocation.arguments.get("path").and_then(Value::as_str),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            invocation.arguments.get("text").and_then(Value::as_str),
+            Some("fn main() {}")
+        );
+    }
+
+    #[test]
+    fn expands_tilde_in_path() {
+        let home = home_dir().expect("home directory");
+        assert_eq!(
+            expand_path("~/target.txt").expect("expand"),
+            home.join("target.txt")
+        );
+        assert_eq!(expand_path("~").expect("expand"), home);
+        assert_eq!(
+            expand_path("/etc/hosts").expect("expand"),
+            PathBuf::from("/etc/hosts")
+        );
+    }
+
+    #[test]
+    fn replace_in_file_replaces_line_range() {
+        let dir = std::env::temp_dir().join(format!("pairllm-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.txt");
+        fs::write(&path, "line1\nline2\nline3\n").expect("write sample");
+
+        let result = replace_in_file(&json!({
+            "path": path,
+            "start_line": 2,
+            "end_line": 2,
+            "text": "replaced"
+        }))
+        .expect("replace");
+
+        assert!(result.contains("Replaced lines 2-2"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "line1\nreplaced\nline3\n");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

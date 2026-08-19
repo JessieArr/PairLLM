@@ -1,8 +1,9 @@
 mod llm;
+mod settings;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
-use llm::{ChatProgressEvent, ChatTurn, LlmConfig, OllamaMetrics};
+use llm::{ChatProgressEvent, ChatTrace, ChatTurn, LlmConfig, OllamaMetrics, QWEN_MODEL_OPTIONS, qwen_model_index};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -35,6 +36,7 @@ struct Message {
     created_at: DateTime<Local>,
     is_thinking: bool,
     metrics: Option<OllamaMetrics>,
+    trace: Option<ChatTrace>,
 }
 
 struct CommandPrompt {
@@ -52,6 +54,7 @@ enum LlmEvent {
     Reply {
         content: String,
         metrics: OllamaMetrics,
+        trace: ChatTrace,
     },
     Failed { message: String },
 }
@@ -69,6 +72,7 @@ struct ChatApp {
     command_prompt: Option<CommandPrompt>,
     llm_tx: Sender<LlmEvent>,
     llm_rx: Receiver<LlmEvent>,
+    details_trace: Option<ChatTrace>,
 }
 
 impl ChatApp {
@@ -79,7 +83,7 @@ impl ChatApp {
             draft: String::new(),
             status: None,
             scroll_to_bottom: false,
-            llm: LlmConfig::default(),
+            llm: settings::load().unwrap_or_else(LlmConfig::default),
             show_settings: false,
             llm_status: "Checking for Ollama…".into(),
             llm_busy: false,
@@ -87,9 +91,20 @@ impl ChatApp {
             command_prompt: None,
             llm_tx,
             llm_rx,
+            details_trace: None,
         };
         app.check_llm();
         app
+    }
+
+    fn save_settings(&mut self, refresh_ollama: bool) {
+        if let Err(err) = settings::save(&self.llm) {
+            self.status = Some(err);
+        }
+
+        if refresh_ollama && !self.llm_busy {
+            self.check_llm();
+        }
     }
 
     fn check_llm(&mut self) {
@@ -127,6 +142,7 @@ impl ChatApp {
             created_at: Local::now(),
             is_thinking: false,
             metrics: None,
+            trace: None,
         });
 
         self.draft.clear();
@@ -148,6 +164,7 @@ impl ChatApp {
             created_at: Local::now(),
             is_thinking: true,
             metrics: None,
+            trace: None,
         });
         self.thinking_message_index = Some(self.messages.len() - 1);
         self.scroll_to_bottom = true;
@@ -200,6 +217,7 @@ impl ChatApp {
                     let _ = tx.send(LlmEvent::Reply {
                         content: reply.content,
                         metrics: reply.metrics,
+                        trace: reply.trace,
                     });
                 }
                 Err(err) => {
@@ -242,12 +260,14 @@ impl ChatApp {
                 LlmEvent::Models { models } => {
                     if models.is_empty() {
                         self.llm_status =
-                            "Connected, but no models found. Run `ollama pull llama3.2`.".into();
-                    } else if !models.iter().any(|name| name == &self.llm.model) {
-                        self.llm.model = models[0].clone();
+                            "Connected, but no models found. Run `ollama pull qwen3:4b`.".into();
+                    } else if models.iter().any(|name| name == &self.llm.model) {
                         self.llm_status = format!("Connected · using {}", self.llm.model);
                     } else {
-                        self.llm_status = format!("Connected · using {}", self.llm.model);
+                        self.llm_status = format!(
+                            "Connected · `{}` not installed — run `ollama pull {}`",
+                            self.llm.model, self.llm.model
+                        );
                     }
                 }
                 LlmEvent::Thinking { content } => {
@@ -267,13 +287,18 @@ impl ChatApp {
                         response_tx,
                     });
                 }
-                LlmEvent::Reply { content, metrics } => {
+                LlmEvent::Reply {
+                    content,
+                    metrics,
+                    trace,
+                } => {
                     if let Some(index) = self.thinking_message_index.take() {
                         if let Some(message) = self.messages.get_mut(index) {
                             message.content = content;
                             message.is_thinking = false;
                             message.created_at = Local::now();
                             message.metrics = Some(metrics);
+                            message.trace = Some(trace);
                         }
                     } else {
                         self.messages.push(Message {
@@ -282,6 +307,7 @@ impl ChatApp {
                             created_at: Local::now(),
                             is_thinking: false,
                             metrics: Some(metrics),
+                            trace: Some(trace),
                         });
                     }
                     self.llm_busy = false;
@@ -307,6 +333,7 @@ impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_llm_events(ctx);
         self.show_command_prompt(ctx);
+        self.show_details_modal(ctx);
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(8.0);
@@ -340,35 +367,92 @@ impl eframe::App for ChatApp {
 
             if self.show_settings {
                 ui.separator();
-                ui.checkbox(&mut self.llm.enabled, "Reply with local LLM");
+                let mut settings_changed = false;
+                let mut ollama_changed = false;
+
+                if ui
+                    .checkbox(&mut self.llm.enabled, "Reply with local LLM")
+                    .changed()
+                {
+                    settings_changed = true;
+                }
                 ui.horizontal(|ui| {
                     ui.label("Ollama URL");
-                    ui.text_edit_singleline(&mut self.llm.base_url);
+                    if ui.text_edit_singleline(&mut self.llm.base_url).changed() {
+                        settings_changed = true;
+                        ollama_changed = true;
+                    }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Model");
-                    ui.text_edit_singleline(&mut self.llm.model);
+                    ui.label("Qwen model");
+                    let mut selected = qwen_model_index(&self.llm.model);
+                    let selected_text = selected
+                        .map(|index| QWEN_MODEL_OPTIONS[index].label)
+                        .unwrap_or("Custom");
+
+                    let mut model_changed = false;
+                    egui::ComboBox::from_id_salt("qwen_model")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            for (index, option) in QWEN_MODEL_OPTIONS.iter().enumerate() {
+                                if ui
+                                    .selectable_label(selected == Some(index), option.label)
+                                    .clicked()
+                                {
+                                    selected = Some(index);
+                                    self.llm.model = option.tag.to_string();
+                                    model_changed = true;
+                                }
+                            }
+                        });
+
+                    if model_changed {
+                        settings_changed = true;
+                        ollama_changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Model tag");
+                    if ui.text_edit_singleline(&mut self.llm.model).changed() {
+                        settings_changed = true;
+                        ollama_changed = true;
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Context");
-                    ui.add(
-                        egui::DragValue::new(&mut self.llm.num_ctx)
-                            .range(512..=262_144)
-                            .speed(256),
-                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.llm.num_ctx)
+                                .range(512..=262_144)
+                                .speed(256),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Tavily API key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.llm.tavily_api_key)
-                            .password(true)
-                            .hint_text("optional — uses keyless mode if empty"),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.llm.tavily_api_key)
+                                .password(true)
+                                .hint_text("optional — uses keyless mode if empty"),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
                 });
+
+                if settings_changed {
+                    self.save_settings(ollama_changed);
+                }
+
                 ui.label(
                     egui::RichText::new(
-                        "Recommended: install Ollama, run `ollama pull llama3.2`, then Refresh. \
-                         CLI commands require your approval before running.",
+                        "Pull models with Ollama (e.g. `ollama pull qwen3:4b`), pick a size above, \
+                         then Refresh. CLI commands require your approval before running.",
                     )
                     .weak()
                     .small(),
@@ -437,6 +521,7 @@ impl eframe::App for ChatApp {
                 .stick_to_bottom(scroll_to_bottom)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
+                    let mut open_details: Option<ChatTrace> = None;
 
                     for message in &self.messages {
                         let is_user = message.author == USER_NAME;
@@ -500,13 +585,20 @@ impl eframe::App for ChatApp {
                                 });
 
                                 if is_assistant && !message.is_thinking {
-                                    if let Some(metrics) = &message.metrics {
-                                        let summary = metrics.summary_line();
-                                        let tooltip = metrics.tooltip_text();
-                                        ui.add_space(4.0);
-                                        ui.label(egui::RichText::new(summary).weak().small())
-                                            .on_hover_text(tooltip);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if let Some(metrics) = &message.metrics {
+                                            let summary = metrics.summary_line();
+                                            let tooltip = metrics.tooltip_text();
+                                            ui.label(egui::RichText::new(summary).weak().small())
+                                                .on_hover_text(tooltip);
+                                        }
+
+                                        if message.trace.is_some() {
+                                            if ui.small_button("Details").clicked() {
+                                                open_details = message.trace.clone();
+                                            }
+                                        }
+                                    });
                                 }
                             });
 
@@ -515,12 +607,75 @@ impl eframe::App for ChatApp {
                             }
                         });
                     }
+
+                    if let Some(trace) = open_details {
+                        self.details_trace = Some(trace);
+                    }
                 });
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = settings::save(&self.llm);
     }
 }
 
 impl ChatApp {
+    fn show_details_modal(&mut self, ctx: &egui::Context) {
+        let Some(trace) = self.details_trace.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        egui::Window::new("LLM exchange details")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(720.0)
+            .default_height(640.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Everything sent to and received from Ollama for this reply, including \
+                         the system prompt and any tool-call rounds.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("details_trace")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, round) in trace.rounds.iter().enumerate() {
+                            let default_open = index + 1 == trace.rounds.len();
+                            ui.push_id(index, |ui| {
+                                egui::CollapsingHeader::new(format!("Round {}", index + 1))
+                                    .default_open(default_open)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Sent to LLM").strong());
+                                        ui.add_space(4.0);
+                                        show_json_block(ui, &round.request, "request");
+
+                                        ui.add_space(12.0);
+                                        ui.label(egui::RichText::new("Received from LLM").strong());
+                                        ui.add_space(4.0);
+                                        show_json_block(ui, &round.response, "response");
+                                    });
+                            });
+
+                            ui.add_space(8.0);
+                        }
+                    });
+            });
+
+        if !open {
+            self.details_trace = None;
+        }
+    }
+
     fn show_command_prompt(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.command_prompt.as_ref() else {
             return;
@@ -568,4 +723,30 @@ impl ChatApp {
                 });
             });
     }
+}
+
+fn show_json_block(ui: &mut egui::Ui, value: &serde_json::Value, block_id: &str) {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+
+    ui.push_id(block_id, |ui| {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(15, 18, 26))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(42, 49, 64),
+            ))
+            .inner_margin(10.0)
+            .corner_radius(8.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("json")
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).monospace())
+                                .selectable(true),
+                        );
+                    });
+            });
+    });
 }

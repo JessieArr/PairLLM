@@ -23,6 +23,8 @@ Release builds enable thin LTO, single codegen unit, and strip debug symbols for
 - **Shift+Enter** inserts a newline
 - Open **Settings** to configure the local LLM
 
+Settings (model, Ollama URL, context size, Tavily key, etc.) are saved to `~/.config/pairllm/settings.json` and restored on the next launch.
+
 ## Local LLM setup (recommended: Ollama)
 
 **Ollama** is the easiest option for app integration:
@@ -31,8 +33,10 @@ Release builds enable thin LTO, single codegen unit, and strip debug symbols for
 2. Pull a model:
 
 ```bash
-ollama pull llama3.2
+ollama pull qwen3:4b
 ```
+
+Other sizes: `qwen3:0.6b`, `qwen3:1.7b`, `qwen3:4b` — selectable in **Settings**.
 
 3. Make sure Ollama is running (`ollama serve` — often started automatically)
 4. Click **Refresh** in the app header
@@ -41,12 +45,14 @@ The app talks to Ollama at `http://127.0.0.1:11434` using its native `/api/chat`
 
 ### Tools
 
-The assistant can call tools when it needs extra information:
+The assistant can call tools when it needs extra information. The current local time is included in every request's system prompt.
 
 | Tool | Purpose | JSON request |
 |------|---------|--------------|
-| `get_time` | Current local time | `{"tool":"get_time"}` |
 | `web_search` | Web search via [Tavily](https://tavily.com) | `{"tool":"web_search","query":"your search"}` |
+| `list_files` | List files in a directory (like `ls`) | `{"tool":"list_files","path":"/path/to/dir"}` |
+| `read_file` | Read a text file | `{"tool":"read_file","path":"/path/to/file"}` |
+| `replace_in_file` | Replace a line range in a file (1-based, inclusive) | `{"tool":"replace_in_file","path":"/path/to/file","start_line":1,"end_line":3,"text":"new content"}` |
 | `run_command` | Run a shell command (requires approval) | `{"tool":"run_command","command":"ls -la"}` |
 
 The app runs tools locally (or calls Tavily), sends the result back to the model, and then the model answers the user. **CLI commands are never run automatically** — you must approve them in a confirmation dialog first.
