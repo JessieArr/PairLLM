@@ -7,9 +7,13 @@ use std::sync::{mpsc::{self, Sender}, OnceLock};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MODEL: &str = "llama3.2";
+const DEFAULT_NUM_CTX: u32 = 16384;
 const MAX_TOOL_ROUNDS: usize = 8;
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_COMMAND_OUTPUT: usize = 8000;
+const MAX_TOOL_RESULT_CHARS: usize = 4000;
+const MAX_CONTEXT_MESSAGES: usize = 20;
+const MAX_CONTEXT_MESSAGE_CHARS: usize = 3000;
 const KEEP_ALIVE: &str = "30m";
 
 const SYSTEM_PROMPT: &str = "\
@@ -33,6 +37,7 @@ pub struct LlmConfig {
     pub enabled: bool,
     pub base_url: String,
     pub model: String,
+    pub num_ctx: u32,
     pub tavily_api_key: String,
 }
 
@@ -42,9 +47,115 @@ impl Default for LlmConfig {
             enabled: true,
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
+            num_ctx: DEFAULT_NUM_CTX,
             tavily_api_key: std::env::var("TAVILY_API_KEY").unwrap_or_default(),
         }
     }
+}
+
+#[derive(Clone, Default)]
+pub struct OllamaMetrics {
+    pub total_duration_ns: u64,
+    pub load_duration_ns: u64,
+    pub prompt_eval_count: u64,
+    pub prompt_eval_duration_ns: u64,
+    pub eval_count: u64,
+    pub eval_duration_ns: u64,
+    pub request_count: u32,
+    pub http_headers: Vec<(String, String)>,
+}
+
+impl OllamaMetrics {
+    pub fn merge(&mut self, other: &Self) {
+        self.total_duration_ns += other.total_duration_ns;
+        self.load_duration_ns += other.load_duration_ns;
+        self.prompt_eval_count += other.prompt_eval_count;
+        self.prompt_eval_duration_ns += other.prompt_eval_duration_ns;
+        self.eval_count += other.eval_count;
+        self.eval_duration_ns += other.eval_duration_ns;
+        self.request_count += other.request_count;
+
+        for (name, value) in &other.http_headers {
+            if let Some(existing) = self
+                .http_headers
+                .iter_mut()
+                .find(|(existing_name, _)| existing_name == name)
+            {
+                existing.1 = value.clone();
+            } else {
+                self.http_headers.push((name.clone(), value.clone()));
+            }
+        }
+    }
+
+    pub fn summary_line(&self) -> String {
+        format!(
+            "{:.2}s · {:.1} tok/s",
+            self.total_duration_ns as f64 / 1e9,
+            self.generation_tokens_per_second()
+        )
+    }
+
+    pub fn tooltip_text(&self) -> String {
+        let mut lines = vec![
+            format!(
+                "Ollama usage ({} API request{})",
+                self.request_count,
+                if self.request_count == 1 { "" } else { "s" }
+            ),
+            format!(
+                "total_duration: {:.2} ms",
+                self.total_duration_ns as f64 / 1e6
+            ),
+            format!(
+                "load_duration: {:.2} ms",
+                self.load_duration_ns as f64 / 1e6
+            ),
+            format!("prompt_eval_count: {}", self.prompt_eval_count),
+            format!(
+                "prompt_eval_duration: {:.2} ms ({:.1} tok/s prefill)",
+                self.prompt_eval_duration_ns as f64 / 1e6,
+                self.prefill_tokens_per_second()
+            ),
+            format!("eval_count: {}", self.eval_count),
+            format!(
+                "eval_duration: {:.2} ms ({:.1} tok/s gen)",
+                self.eval_duration_ns as f64 / 1e6,
+                self.generation_tokens_per_second()
+            ),
+        ];
+
+        if !self.http_headers.is_empty() {
+            lines.push(String::new());
+            lines.push("Response headers:".into());
+            for (name, value) in &self.http_headers {
+                lines.push(format!("{name}: {value}"));
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    fn prefill_tokens_per_second(&self) -> f64 {
+        tokens_per_second(self.prompt_eval_count, self.prompt_eval_duration_ns)
+    }
+
+    fn generation_tokens_per_second(&self) -> f64 {
+        tokens_per_second(self.eval_count, self.eval_duration_ns)
+    }
+}
+
+pub struct ChatResult {
+    pub content: String,
+    pub metrics: OllamaMetrics,
+}
+
+fn tokens_per_second(token_count: u64, duration_ns: u64) -> f64 {
+    if duration_ns == 0 {
+        return 0.0;
+    }
+
+    token_count as f64 / (duration_ns as f64 / 1e9)
 }
 
 #[derive(Clone, Serialize)]
@@ -68,22 +179,46 @@ struct ToolInvocation {
 }
 
 #[derive(Serialize)]
+struct ModelOptions {
+    num_ctx: u32,
+}
+
+#[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Value>,
     stream: bool,
     tools: Vec<Value>,
     keep_alive: String,
+    truncate: bool,
+    options: ModelOptions,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct StreamChunk {
     message: ChatMessage,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    total_duration: u64,
+    #[serde(default)]
+    load_duration: u64,
+    #[serde(default)]
+    prompt_eval_count: u64,
+    #[serde(default)]
+    prompt_eval_duration: u64,
+    #[serde(default)]
+    eval_count: u64,
+    #[serde(default)]
+    eval_duration: u64,
 }
 
-#[derive(Deserialize)]
+struct StreamChatResult {
+    message: ChatMessage,
+    metrics: OllamaMetrics,
+}
+
+#[derive(Deserialize, Default)]
 struct ChatMessage {
     #[serde(default)]
     content: String,
@@ -153,7 +288,9 @@ pub fn chat(
     config: &LlmConfig,
     messages: &[ChatTurn],
     progress_tx: &Sender<ChatProgressEvent>,
-) -> Result<String, String> {
+) -> Result<ChatResult, String> {
+    let messages = trim_context_messages(messages);
+
     let mut api_messages = vec![json!({
         "role": "system",
         "content": SYSTEM_PROMPT,
@@ -166,11 +303,14 @@ pub fn chat(
     }));
 
     let mut thinking = String::from("Thinking…");
+    let mut metrics = OllamaMetrics::default();
 
     for _ in 0..MAX_TOOL_ROUNDS {
         send_thinking(progress_tx, &thinking);
 
-        let assistant = stream_chat_request(config, &api_messages, &thinking, progress_tx)?;
+        let response = stream_chat_request(config, &api_messages, &thinking, progress_tx)?;
+        metrics.merge(&response.metrics);
+        let assistant = response.message;
 
         if !assistant.content.trim().is_empty() {
             thinking.push_str("\n\n");
@@ -211,7 +351,7 @@ pub fn chat(
             api_messages.push(json!({
                 "role": "tool",
                 "tool_name": invocation.name,
-                "content": result,
+                "content": truncate(&result, MAX_TOOL_RESULT_CHARS),
             }));
             continue;
         }
@@ -220,7 +360,10 @@ pub fn chat(
             return Err("The model returned an empty response.".into());
         }
 
-        return Ok(assistant.content);
+        return Ok(ChatResult {
+            content: assistant.content,
+            metrics,
+        });
     }
 
     Err("The model kept requesting tools without producing a final answer.".into())
@@ -353,12 +496,23 @@ fn truncate(text: &str, max_len: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+fn trim_context_messages(messages: &[ChatTurn]) -> Vec<ChatTurn> {
+    let start = messages.len().saturating_sub(MAX_CONTEXT_MESSAGES);
+    messages[start..]
+        .iter()
+        .map(|turn| ChatTurn {
+            role: turn.role.clone(),
+            content: truncate(&turn.content, MAX_CONTEXT_MESSAGE_CHARS),
+        })
+        .collect()
+}
+
 fn stream_chat_request(
     config: &LlmConfig,
     messages: &[Value],
     thinking_prefix: &str,
     progress_tx: &Sender<ChatProgressEvent>,
-) -> Result<ChatMessage, String> {
+) -> Result<StreamChatResult, String> {
     let url = format!("{}/api/chat", normalize_base_url(&config.base_url));
     let request = ChatRequest {
         model: config.model.clone(),
@@ -366,6 +520,10 @@ fn stream_chat_request(
         stream: true,
         tools: tool_definitions(),
         keep_alive: KEEP_ALIVE.into(),
+        truncate: true,
+        options: ModelOptions {
+            num_ctx: config.num_ctx,
+        },
     };
 
     let response = http_client()
@@ -378,8 +536,23 @@ fn stream_chat_request(
         return Err(format!("Ollama returned HTTP {}", response.status()));
     }
 
+    let http_headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                value.to_str().unwrap_or("<binary>").to_string(),
+            )
+        })
+        .collect();
+
     let mut content = String::new();
     let mut tool_calls = Vec::new();
+    let mut metrics = OllamaMetrics {
+        http_headers,
+        ..OllamaMetrics::default()
+    };
     let reader = BufReader::new(response);
 
     for line in reader.lines() {
@@ -404,10 +577,21 @@ fn stream_chat_request(
             if content.is_empty() && !chunk.message.content.is_empty() {
                 content = chunk.message.content;
             }
+
+            metrics.total_duration_ns += chunk.total_duration;
+            metrics.load_duration_ns += chunk.load_duration;
+            metrics.prompt_eval_count += chunk.prompt_eval_count;
+            metrics.prompt_eval_duration_ns += chunk.prompt_eval_duration;
+            metrics.eval_count += chunk.eval_count;
+            metrics.eval_duration_ns += chunk.eval_duration;
+            metrics.request_count += 1;
         }
     }
 
-    Ok(ChatMessage { content, tool_calls })
+    Ok(StreamChatResult {
+        message: ChatMessage { content, tool_calls },
+        metrics,
+    })
 }
 
 fn format_streaming_thinking(prefix: &str, streamed: &str) -> String {
@@ -668,6 +852,39 @@ fn connection_error(err: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_metrics_summary() {
+        let metrics = OllamaMetrics {
+            total_duration_ns: 2_500_000_000,
+            eval_count: 100,
+            eval_duration_ns: 2_000_000_000,
+            request_count: 2,
+            ..OllamaMetrics::default()
+        };
+
+        assert_eq!(metrics.summary_line(), "2.50s · 50.0 tok/s");
+        assert!(metrics.tooltip_text().contains("prompt_eval_count"));
+    }
+
+    #[test]
+    fn trims_old_context_messages() {
+        let messages: Vec<ChatTurn> = (0..30)
+            .map(|index| ChatTurn {
+                role: if index % 2 == 0 {
+                    "user".into()
+                } else {
+                    "assistant".into()
+                },
+                content: format!("message {index}"),
+            })
+            .collect();
+
+        let trimmed = trim_context_messages(&messages);
+        assert_eq!(trimmed.len(), MAX_CONTEXT_MESSAGES);
+        assert_eq!(trimmed[0].content, "message 10");
+        assert_eq!(trimmed.last().unwrap().content, "message 29");
+    }
 
     #[test]
     fn parses_json_get_time_request() {

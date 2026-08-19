@@ -2,7 +2,7 @@ mod llm;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
-use llm::{ChatProgressEvent, ChatTurn, LlmConfig};
+use llm::{ChatProgressEvent, ChatTurn, LlmConfig, OllamaMetrics};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -34,6 +34,7 @@ struct Message {
     content: String,
     created_at: DateTime<Local>,
     is_thinking: bool,
+    metrics: Option<OllamaMetrics>,
 }
 
 struct CommandPrompt {
@@ -48,7 +49,10 @@ enum LlmEvent {
         command: String,
         response_tx: Sender<Result<String, String>>,
     },
-    Reply { content: String },
+    Reply {
+        content: String,
+        metrics: OllamaMetrics,
+    },
     Failed { message: String },
 }
 
@@ -122,6 +126,7 @@ impl ChatApp {
             content: content.to_string(),
             created_at: Local::now(),
             is_thinking: false,
+            metrics: None,
         });
 
         self.draft.clear();
@@ -142,6 +147,7 @@ impl ChatApp {
             content: "Thinking…".into(),
             created_at: Local::now(),
             is_thinking: true,
+            metrics: None,
         });
         self.thinking_message_index = Some(self.messages.len() - 1);
         self.scroll_to_bottom = true;
@@ -190,8 +196,11 @@ impl ChatApp {
             progress_handle.join().ok();
 
             match result {
-                Ok(content) => {
-                    let _ = tx.send(LlmEvent::Reply { content });
+                Ok(reply) => {
+                    let _ = tx.send(LlmEvent::Reply {
+                        content: reply.content,
+                        metrics: reply.metrics,
+                    });
                 }
                 Err(err) => {
                     let _ = tx.send(LlmEvent::Failed { message: err });
@@ -258,12 +267,13 @@ impl ChatApp {
                         response_tx,
                     });
                 }
-                LlmEvent::Reply { content } => {
+                LlmEvent::Reply { content, metrics } => {
                     if let Some(index) = self.thinking_message_index.take() {
                         if let Some(message) = self.messages.get_mut(index) {
                             message.content = content;
                             message.is_thinking = false;
                             message.created_at = Local::now();
+                            message.metrics = Some(metrics);
                         }
                     } else {
                         self.messages.push(Message {
@@ -271,6 +281,7 @@ impl ChatApp {
                             content,
                             created_at: Local::now(),
                             is_thinking: false,
+                            metrics: Some(metrics),
                         });
                     }
                     self.llm_busy = false;
@@ -337,6 +348,14 @@ impl eframe::App for ChatApp {
                 ui.horizontal(|ui| {
                     ui.label("Model");
                     ui.text_edit_singleline(&mut self.llm.model);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Context");
+                    ui.add(
+                        egui::DragValue::new(&mut self.llm.num_ctx)
+                            .range(512..=262_144)
+                            .speed(256),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Tavily API key");
@@ -479,6 +498,16 @@ impl eframe::App for ChatApp {
                                     };
                                     ui.label(text);
                                 });
+
+                                if is_assistant && !message.is_thinking {
+                                    if let Some(metrics) = &message.metrics {
+                                        let summary = metrics.summary_line();
+                                        let tooltip = metrics.tooltip_text();
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new(summary).weak().small())
+                                            .on_hover_text(tooltip);
+                                    }
+                                }
                             });
 
                             if !is_user {

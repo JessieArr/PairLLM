@@ -4,9 +4,20 @@ A simple Rust desktop chat app built with [egui](https://github.com/emilk/egui).
 
 ## Run
 
+Development build:
+
 ```bash
 cargo run
 ```
+
+Optimized release build:
+
+```bash
+cargo build --release
+./target/release/pairllm
+```
+
+Release builds enable thin LTO, single codegen unit, and strip debug symbols for a smaller, faster binary.
 
 - **Enter** sends a message
 - **Shift+Enter** inserts a newline
