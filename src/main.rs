@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 const ASSISTANT_NAME: &str = "Assistant";
+const USER_NAME: &str = "You";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -32,17 +33,18 @@ struct Message {
     author: String,
     content: String,
     created_at: DateTime<Local>,
+    is_thinking: bool,
 }
 
 enum LlmEvent {
     Models { models: Vec<String> },
+    Thinking { content: String },
     Reply { content: String },
     Failed { message: String },
 }
 
 struct ChatApp {
     messages: Vec<Message>,
-    author: String,
     draft: String,
     status: Option<String>,
     scroll_to_bottom: bool,
@@ -50,6 +52,7 @@ struct ChatApp {
     show_settings: bool,
     llm_status: String,
     llm_busy: bool,
+    thinking_message_index: Option<usize>,
     llm_tx: Sender<LlmEvent>,
     llm_rx: Receiver<LlmEvent>,
 }
@@ -59,7 +62,6 @@ impl ChatApp {
         let (llm_tx, llm_rx) = mpsc::channel();
         let mut app = Self {
             messages: Vec::new(),
-            author: String::new(),
             draft: String::new(),
             status: None,
             scroll_to_bottom: false,
@@ -67,6 +69,7 @@ impl ChatApp {
             show_settings: false,
             llm_status: "Checking for Ollama…".into(),
             llm_busy: false,
+            thinking_message_index: None,
             llm_tx,
             llm_rx,
         };
@@ -92,11 +95,10 @@ impl ChatApp {
     }
 
     fn send_message(&mut self, ctx: &egui::Context) {
-        let author = self.author.trim();
         let content = self.draft.trim();
 
-        if author.is_empty() || content.is_empty() {
-            self.status = Some("Enter your name and a message before sending.".into());
+        if content.is_empty() {
+            self.status = Some("Enter a message before sending.".into());
             return;
         }
 
@@ -105,9 +107,10 @@ impl ChatApp {
         }
 
         self.messages.push(Message {
-            author: author.to_string(),
+            author: USER_NAME.into(),
             content: content.to_string(),
             created_at: Local::now(),
+            is_thinking: false,
         });
 
         self.draft.clear();
@@ -122,30 +125,46 @@ impl ChatApp {
     fn request_llm_reply(&mut self, ctx: &egui::Context) {
         self.llm_busy = true;
         self.llm_status = format!("Connected · {} (thinking…)", self.llm.model);
+
+        self.messages.push(Message {
+            author: ASSISTANT_NAME.into(),
+            content: "Thinking…".into(),
+            created_at: Local::now(),
+            is_thinking: true,
+        });
+        self.thinking_message_index = Some(self.messages.len() - 1);
+        self.scroll_to_bottom = true;
         ctx.request_repaint();
 
         let tx = self.llm_tx.clone();
-        let base_url = self.llm.base_url.clone();
-        let model = self.llm.model.clone();
+        let config = self.llm.clone();
         let turns = self
             .messages
             .iter()
+            .filter(|message| !message.is_thinking)
             .map(|message| ChatTurn {
                 role: if message.author == ASSISTANT_NAME {
                     "assistant".into()
                 } else {
                     "user".into()
                 },
-                content: if message.author == ASSISTANT_NAME {
-                    message.content.clone()
-                } else {
-                    format!("{}: {}", message.author, message.content)
-                },
+                content: message.content.clone(),
             })
             .collect::<Vec<_>>();
 
         thread::spawn(move || {
-            let result = llm::chat(&base_url, &model, &turns);
+            let (thinking_tx, thinking_rx) = mpsc::channel();
+            let progress_tx = tx.clone();
+            let progress_handle = thread::spawn(move || {
+                while let Ok(content) = thinking_rx.recv() {
+                    let _ = progress_tx.send(LlmEvent::Thinking { content });
+                }
+            });
+
+            let result = llm::chat(&config, &turns, &thinking_tx);
+            drop(thinking_tx);
+            progress_handle.join().ok();
+
             match result {
                 Ok(content) => {
                     let _ = tx.send(LlmEvent::Reply { content });
@@ -155,6 +174,14 @@ impl ChatApp {
                 }
             }
         });
+    }
+
+    fn remove_thinking_message(&mut self) {
+        if let Some(index) = self.thinking_message_index.take() {
+            if index < self.messages.len() {
+                self.messages.remove(index);
+            }
+        }
     }
 
     fn poll_llm_events(&mut self, ctx: &egui::Context) {
@@ -171,18 +198,38 @@ impl ChatApp {
                         self.llm_status = format!("Connected · using {}", self.llm.model);
                     }
                 }
+                LlmEvent::Thinking { content } => {
+                    if let Some(index) = self.thinking_message_index {
+                        if let Some(message) = self.messages.get_mut(index) {
+                            message.content = content;
+                            self.scroll_to_bottom = true;
+                        }
+                    }
+                }
                 LlmEvent::Reply { content } => {
-                    self.messages.push(Message {
-                        author: ASSISTANT_NAME.into(),
-                        content,
-                        created_at: Local::now(),
-                    });
+                    if let Some(index) = self.thinking_message_index.take() {
+                        if let Some(message) = self.messages.get_mut(index) {
+                            message.content = content;
+                            message.is_thinking = false;
+                            message.created_at = Local::now();
+                        }
+                    } else {
+                        self.messages.push(Message {
+                            author: ASSISTANT_NAME.into(),
+                            content,
+                            created_at: Local::now(),
+                            is_thinking: false,
+                        });
+                    }
                     self.llm_busy = false;
                     self.llm_status = format!("Connected · using {}", self.llm.model);
                     self.scroll_to_bottom = true;
                 }
                 LlmEvent::Failed { message } => {
-                    self.llm_busy = false;
+                    if self.llm_busy {
+                        self.remove_thinking_message();
+                        self.llm_busy = false;
+                    }
                     self.llm_status = message.clone();
                     self.status = Some(message);
                 }
@@ -237,9 +284,18 @@ impl eframe::App for ChatApp {
                     ui.label("Model");
                     ui.text_edit_singleline(&mut self.llm.model);
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Tavily API key");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.llm.tavily_api_key)
+                            .password(true)
+                            .hint_text("optional — uses keyless mode if empty"),
+                    );
+                });
                 ui.label(
                     egui::RichText::new(
-                        "Recommended: install Ollama, run `ollama pull llama3.2`, then Refresh.",
+                        "Recommended: install Ollama, run `ollama pull llama3.2`, then Refresh. \
+                         For web search, add a Tavily key from tavily.com.",
                     )
                     .weak()
                     .small(),
@@ -251,18 +307,6 @@ impl eframe::App for ChatApp {
 
         egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
             ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                ui.add_enabled(
-                    !self.llm_busy,
-                    egui::TextEdit::singleline(&mut self.author)
-                        .desired_width(140.0)
-                        .hint_text("Your name"),
-                );
-            });
-
-            ui.add_space(6.0);
 
             ui.horizontal(|ui| {
                 let response = ui.add_enabled(
@@ -288,14 +332,6 @@ impl eframe::App for ChatApp {
                 }
             });
 
-            if self.llm_busy {
-                ui.label(
-                    egui::RichText::new("Waiting for the assistant…")
-                        .weak()
-                        .italics(),
-                );
-            }
-
             if let Some(status) = &self.status {
                 ui.colored_label(egui::Color32::from_rgb(255, 143, 143), status);
             } else {
@@ -318,7 +354,6 @@ impl eframe::App for ChatApp {
                 return;
             }
 
-            let author = self.author.trim().to_string();
             let scroll_to_bottom = self.scroll_to_bottom;
             self.scroll_to_bottom = false;
 
@@ -329,11 +364,11 @@ impl eframe::App for ChatApp {
                     ui.spacing_mut().item_spacing.y = 10.0;
 
                     for message in &self.messages {
-                        let is_self = message.author == author;
+                        let is_user = message.author == USER_NAME;
                         let is_assistant = message.author == ASSISTANT_NAME;
 
                         ui.horizontal(|ui| {
-                            if is_self {
+                            if is_user {
                                 ui.add_space(ui.available_width() * 0.15);
                             }
 
@@ -342,13 +377,17 @@ impl eframe::App for ChatApp {
 
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(&message.author)
-                                            .strong()
-                                            .color(if is_assistant {
-                                                egui::Color32::from_rgb(120, 214, 143)
-                                            } else {
-                                                egui::Color32::from_rgb(108, 140, 255)
-                                            }),
+                                        egui::RichText::new(if message.is_thinking {
+                                            "Assistant (thinking)"
+                                        } else {
+                                            &message.author
+                                        })
+                                        .strong()
+                                        .color(if is_assistant {
+                                            egui::Color32::from_rgb(120, 214, 143)
+                                        } else {
+                                            egui::Color32::from_rgb(108, 140, 255)
+                                        }),
                                     );
                                     ui.label(
                                         egui::RichText::new(
@@ -360,7 +399,7 @@ impl eframe::App for ChatApp {
                                 });
 
                                 let frame = egui::Frame::new()
-                                    .fill(if is_self {
+                                    .fill(if is_user {
                                         egui::Color32::from_rgb(36, 48, 74)
                                     } else if is_assistant {
                                         egui::Color32::from_rgb(28, 44, 38)
@@ -375,11 +414,18 @@ impl eframe::App for ChatApp {
                                     .corner_radius(8.0);
 
                                 frame.show(ui, |ui| {
-                                    ui.label(&message.content);
+                                    let text = if message.is_thinking {
+                                        egui::RichText::new(&message.content)
+                                            .weak()
+                                            .italics()
+                                    } else {
+                                        egui::RichText::new(&message.content)
+                                    };
+                                    ui.label(text);
                                 });
                             });
 
-                            if !is_self {
+                            if !is_user {
                                 ui.add_space(ui.available_width() * 0.15);
                             }
                         });

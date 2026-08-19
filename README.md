@@ -30,13 +30,25 @@ The app talks to Ollama at `http://127.0.0.1:11434` using its native `/api/chat`
 
 ### Tools
 
-The assistant can call a `get_time` tool when it needs the current time. It requests the tool as JSON:
+The assistant can call tools when it needs extra information:
 
-```json
-{"tool":"get_time"}
+| Tool | Purpose | JSON request |
+|------|---------|--------------|
+| `get_time` | Current local time | `{"tool":"get_time"}` |
+| `web_search` | Web search via [Tavily](https://tavily.com) | `{"tool":"web_search","query":"your search"}` |
+
+The app runs the tool locally (or calls Tavily), sends the result back to the model, and then the model answers the user.
+
+#### Tavily setup
+
+Web search works out of the box with Tavily's **keyless mode** (no account or API key required, rate-limited). For higher limits, add a free API key from [tavily.com](https://tavily.com):
+
+```bash
+export TAVILY_API_KEY=tvly-your-key-here
+cargo run
 ```
 
-The app runs the tool locally, sends the result back to the model, and then the model answers the user (for example: "What time is it?").
+Or paste the key in **Settings** in the app. When a key is provided, it takes precedence over keyless mode.
 
 ### Other local options
 
