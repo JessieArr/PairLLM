@@ -76,6 +76,15 @@ for backreferences.",
         json_example: r#"{"tool":"sed","path":"/path/to/file.txt","expression":"s/old/new/"}"#,
     },
     ToolSpec {
+        name: "ps",
+        platform: ToolPlatform::Unix,
+        prompt_line: "- ps: lists running processes. Runs \
+`ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm [--sort=sort] [| grep pattern] | head -n 30`. \
+Optional grep pattern and sort field (e.g. rss or %cpu). Sort is ascending by default; prefix with `-` \
+for descending (e.g. -rss).",
+        json_example: r#"{"tool":"ps","pattern":"nginx","sort":"-rss"}"#,
+    },
+    ToolSpec {
         name: "run_command",
         platform: ToolPlatform::All,
         prompt_line: "- run_command: runs a shell command on the user's machine. The user must approve \
@@ -795,6 +804,7 @@ fn format_tool_arguments(invocation: &ToolInvocation) -> String {
         "ls" => format_ls_arguments(&parsed),
         "cat" => format_cat_arguments(&parsed),
         "sed" => format_sed_arguments(&parsed),
+        "ps" => format_ps_arguments(&parsed),
         "run_command" => command_from_arguments(&parsed)
             .map(|command| format!("command: {command}"))
             .unwrap_or_else(|err| err),
@@ -826,6 +836,20 @@ fn tool_result_summary(tool_name: &str, result: &str) -> String {
             }
         }
         "sed" => result.to_string(),
+        "ps" => {
+            let content = result
+                .split_once("\n\n")
+                .map(|(_, body)| body)
+                .unwrap_or(result);
+            let lines = content.lines().filter(|line| !line.trim().is_empty()).count();
+            if result.contains("… truncated") {
+                format!("{lines} matching processes (truncated)")
+            } else if lines == 0 || content.contains("(no matching processes)") {
+                "No matching processes".into()
+            } else {
+                format!("{lines} matching processes")
+            }
+        }
         "web_search" => {
             if result.contains("No results found.") {
                 return "No results found".into();
@@ -902,6 +926,14 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
                 ));
             }
         }
+        "ps" => {
+            let pattern = grep_pattern_from_arguments(&invocation.arguments);
+            let sort = sort_from_arguments(&invocation.arguments);
+            thinking.push_str(&format!(
+                " ({})",
+                format_ps_command(pattern.as_deref(), sort.as_deref())
+            ));
+        }
         "run_command" => {
             if let Ok(command) = command_from_arguments(&invocation.arguments) {
                 thinking.push_str(&format!("\n  `$ {command}`"));
@@ -913,7 +945,7 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
 
 fn summarize_tool_result(tool_name: &str, result: &str) -> String {
     match tool_name {
-        "cat" | "run_command" | "web_search" => truncate(result, 600),
+        "cat" | "ps" | "run_command" | "web_search" => truncate(result, 600),
         "ls" | "sed" => result.to_string(),
         _ => truncate(result, 600),
     }
@@ -1152,6 +1184,27 @@ fn tool_definition(spec: &ToolSpec) -> Value {
                 }
             }
         }),
+        "ps" => json!({
+            "type": "function",
+            "function": {
+                "name": "ps",
+                "description": "List running processes with ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm, optionally sorted and filtered by grep, limited to 30 lines",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Optional grep-style regex to filter the process list"
+                        },
+                        "sort": {
+                            "type": "string",
+                            "description": "Optional ps --sort value (e.g. rss, %cpu). Ascending by default; prefix with - for descending (e.g. -rss)"
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
         "run_command" => json!({
             "type": "function",
             "function": {
@@ -1185,6 +1238,7 @@ fn execute_tool(invocation: &ToolInvocation, config: &LlmConfig) -> Result<Strin
         "ls" => ls(&invocation.arguments),
         "cat" => cat(&invocation.arguments),
         "sed" => sed(&invocation.arguments),
+        "ps" => ps(&invocation.arguments),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -1486,6 +1540,156 @@ fn grep_pattern_from_arguments(arguments: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn sort_from_arguments(arguments: &Value) -> Option<String> {
+    let parsed = normalize_arguments(arguments);
+    parsed
+        .get("sort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|sort| !sort.is_empty())
+        .map(str::to_string)
+}
+
+fn format_ps_command(pattern: Option<&str>, sort: Option<&str>) -> String {
+    let mut command = "ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm".to_string();
+    if let Some(sort) = sort {
+        command.push_str(&format!(" --sort={sort}"));
+    }
+    if let Some(pattern) = pattern {
+        command.push_str(&format!(" | grep '{pattern}'"));
+    }
+    command.push_str(" | head -n 30");
+    command
+}
+
+fn format_ps_arguments(arguments: &Value) -> String {
+    let parsed = normalize_arguments(arguments);
+    let pattern = grep_pattern_from_arguments(&parsed);
+    let sort = sort_from_arguments(&parsed);
+    let mut lines = vec![format!(
+        "command: {}",
+        format_ps_command(pattern.as_deref(), sort.as_deref())
+    )];
+    if let Some(pattern) = pattern {
+        lines.push(format!("pattern: {pattern}"));
+    } else {
+        lines.push("pattern: (none)".into());
+    }
+    if let Some(sort) = sort {
+        lines.push(format!("sort: {sort}"));
+    } else {
+        lines.push("sort: (none)".into());
+    }
+    lines.join("\n")
+}
+
+fn ps(arguments: &Value) -> Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = arguments;
+        return Err("The ps tool is only available on Linux and macOS.".into());
+    }
+
+    #[cfg(unix)]
+    {
+        let parsed = normalize_arguments(arguments);
+        let pattern = grep_pattern_from_arguments(&parsed);
+        let sort = sort_from_arguments(&parsed);
+        let command_label = format_ps_command(pattern.as_deref(), sort.as_deref());
+
+        let mut ps_command = Command::new("ps");
+        ps_command
+            .args(["-eo", "pid,ppid,user,stat,%cpu,%mem,rss,etime,comm"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(sort) = &sort {
+            ps_command.arg(format!("--sort={sort}"));
+        }
+
+        let mut ps_child = ps_command
+            .spawn()
+            .map_err(|err| format!("Could not run ps: {err}"))?;
+
+        let ps_stdout = ps_child
+            .stdout
+            .take()
+            .ok_or_else(|| "Could not capture ps output.".to_string())?;
+
+        let (head_output, grep_status) = if let Some(pattern) = &pattern {
+            let mut grep_child = Command::new("grep")
+                .arg(pattern)
+                .stdin(ps_stdout)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|err| format!("Could not run grep: {err}"))?;
+
+            let grep_stdout = grep_child
+                .stdout
+                .take()
+                .ok_or_else(|| "Could not capture grep output.".to_string())?;
+
+            let head_output = Command::new("head")
+                .args(["-n", "30"])
+                .stdin(grep_stdout)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|err| format!("Could not run head: {err}"))?;
+
+            let grep_status = grep_child
+                .wait()
+                .map_err(|err| format!("Could not wait for grep: {err}"))?;
+            (head_output, Some(grep_status))
+        } else {
+            let head_output = Command::new("head")
+                .args(["-n", "30"])
+                .stdin(ps_stdout)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|err| format!("Could not run head: {err}"))?;
+            (head_output, None)
+        };
+
+        let ps_status = ps_child
+            .wait()
+            .map_err(|err| format!("Could not wait for ps: {err}"))?;
+
+        if !ps_status.success() {
+            return Err(format!("{command_label} failed: ps exited with an error"));
+        }
+
+        if let Some(grep_status) = grep_status {
+            if grep_status.code() == Some(1) {
+                return Ok(format!("{command_label}\n\n(no matching processes)"));
+            }
+            if !grep_status.success() {
+                return Err(format!("{command_label} failed: grep exited with an error"));
+            }
+        }
+
+        if !head_output.status.success() {
+            return Err(format!("{command_label} failed: head exited with an error"));
+        }
+
+        let stdout = String::from_utf8_lossy(&head_output.stdout);
+        if stdout.trim().is_empty() {
+            let empty_message = if pattern.is_some() {
+                "(no matching processes)"
+            } else {
+                "(no processes)"
+            };
+            return Ok(format!("{command_label}\n\n{empty_message}"));
+        }
+
+        Ok(truncate(
+            &format!("{command_label}\n\n{}", stdout.trim_end()),
+            MAX_COMMAND_OUTPUT,
+        ))
+    }
+}
+
 fn format_cat_command(path: &PathBuf, pattern: Option<&str>, flags: &str) -> String {
     let line_numbers = flags.contains('n');
     match pattern {
@@ -1736,6 +1940,12 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
                 "expression": value.get("expression").or_else(|| value.pointer("/arguments/expression")).cloned().unwrap_or(Value::Null),
             })
         }
+        "ps" => {
+            json!({
+                "pattern": value.get("pattern").or_else(|| value.pointer("/arguments/pattern")).cloned().unwrap_or(Value::Null),
+                "sort": value.get("sort").or_else(|| value.pointer("/arguments/sort")).cloned().unwrap_or(Value::Null),
+            })
+        }
         _ => json!({}),
     };
 
@@ -1833,16 +2043,23 @@ mod tests {
             assert!(prompt.contains("\"tool\":\"ls\""));
             assert!(prompt.contains("\"tool\":\"cat\""));
             assert!(prompt.contains("sed"));
+            assert!(prompt.contains("\"tool\":\"ps\""));
         } else {
             assert!(!prompt.contains("\"tool\":\"ls\""));
             assert!(!prompt.contains("\"tool\":\"cat\""));
             assert!(!prompt.contains("\"tool\":\"sed\""));
+            assert!(!prompt.contains("\"tool\":\"ps\""));
         }
     }
 
     #[test]
     fn sed_availability_matches_platform() {
         assert_eq!(is_supported_tool("sed"), cfg!(unix));
+    }
+
+    #[test]
+    fn ps_availability_matches_platform() {
+        assert_eq!(is_supported_tool("ps"), cfg!(unix));
     }
 
     #[test]
@@ -2051,6 +2268,57 @@ mod tests {
             invocation.arguments.get("flags").and_then(Value::as_str),
             Some("n")
         );
+    }
+
+    #[test]
+    fn parses_json_ps_request() {
+        let request = parse_tool_request(
+            r#"{"tool":"ps","pattern":"nginx","sort":"-rss"}"#,
+            &[],
+        );
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "ps");
+        assert_eq!(
+            invocation.arguments.get("pattern").and_then(Value::as_str),
+            Some("nginx")
+        );
+        assert_eq!(
+            invocation.arguments.get("sort").and_then(Value::as_str),
+            Some("-rss")
+        );
+    }
+
+    #[test]
+    fn ps_runs_without_pattern_or_sort() {
+        let request = parse_tool_request(r#"{"tool":"ps"}"#, &[]);
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "ps");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ps_lists_processes_without_filters() {
+        let result = ps(&json!({})).expect("ps");
+        assert!(result.starts_with("ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm | head -n 30"));
+        assert!(!result.contains("| grep"));
+        assert!(result.contains("PID") || result.lines().count() > 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ps_filters_processes_by_pattern() {
+        let result = ps(&json!({ "pattern": "systemd" })).expect("ps");
+        assert!(result.starts_with("ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm"));
+        assert!(result.contains("| grep 'systemd' | head -n 30"));
+        assert!(result.contains("systemd") || result.contains("(no matching processes)"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ps_supports_optional_sort() {
+        let result = ps(&json!({ "pattern": "systemd", "sort": "-rss" })).expect("ps");
+        assert!(result.contains(" --sort=-rss "));
+        assert!(result.contains("| grep 'systemd' | head -n 30"));
     }
 
     #[test]

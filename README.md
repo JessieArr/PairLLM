@@ -53,8 +53,9 @@ The assistant can call tools when it needs extra information. The current local 
 | `ls` | List files in a directory (Linux/macOS only; optional flags `a`, `l`, `R`) | `{"tool":"ls","path":"/path/to/dir","flags":"la"}` |
 | `cat` | Print a file's contents (Linux/macOS only; optional flag `n` for line numbers). When searching for something specific, pass a grep-style `pattern` and use `flags: "n"`. | `{"tool":"cat","path":"/path/to/file","pattern":"fn main","flags":"n"}` |
 | `sed` | Search-and-replace in a file (like `sed -i 's/pattern/replacement/' file.txt`; Linux/macOS only). Escape `\`, `&`, `/`, and backreferences in the replacement. | `{"tool":"sed","path":"/path/to/file.txt","expression":"s/old/new/"}` |
+| `ps` | List running processes (Linux/macOS only): `ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm [--sort=sort] [| grep pattern] \| head -n 30`. Sort is ascending by default; prefix with `-` for descending (e.g. `-rss`). | `{"tool":"ps","pattern":"nginx","sort":"-rss"}` |
 
-Some tools are platform-specific. On Windows, `ls`, `cat`, and `sed` are omitted from the tool list exposed to the model.
+Some tools are platform-specific. On Windows, `ls`, `cat`, `sed`, and `ps` are omitted from the tool list exposed to the model.
 
 | `run_command` | Run a shell command (requires approval) | `{"tool":"run_command","command":"ls -la"}` |
 
