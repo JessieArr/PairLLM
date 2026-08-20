@@ -3,7 +3,7 @@ mod settings;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
-use llm::{ChatProgressEvent, ChatTrace, ChatTurn, LlmConfig, OllamaMetrics, QWEN_MODEL_OPTIONS, qwen_model_index};
+use llm::{ChatProgressEvent, ChatTrace, ChatTurn, LlmConfig, OllamaMetrics, ToolActionUpdate, QWEN_MODEL_OPTIONS, qwen_model_index};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -35,6 +35,8 @@ struct Message {
     content: String,
     created_at: DateTime<Local>,
     is_thinking: bool,
+    is_tool: bool,
+    tool_success: Option<bool>,
     metrics: Option<OllamaMetrics>,
     trace: Option<ChatTrace>,
 }
@@ -47,6 +49,7 @@ struct CommandPrompt {
 enum LlmEvent {
     Models { models: Vec<String> },
     Thinking { content: String },
+    ToolAction { update: ToolActionUpdate },
     CommandApprovalNeeded {
         command: String,
         response_tx: Sender<Result<String, String>>,
@@ -69,6 +72,7 @@ struct ChatApp {
     llm_status: String,
     llm_busy: bool,
     thinking_message_index: Option<usize>,
+    pending_tool_message_index: Option<usize>,
     command_prompt: Option<CommandPrompt>,
     llm_tx: Sender<LlmEvent>,
     llm_rx: Receiver<LlmEvent>,
@@ -88,6 +92,7 @@ impl ChatApp {
             llm_status: "Checking for Ollama…".into(),
             llm_busy: false,
             thinking_message_index: None,
+            pending_tool_message_index: None,
             command_prompt: None,
             llm_tx,
             llm_rx,
@@ -141,6 +146,8 @@ impl ChatApp {
             content: content.to_string(),
             created_at: Local::now(),
             is_thinking: false,
+            is_tool: false,
+            tool_success: None,
             metrics: None,
             trace: None,
         });
@@ -163,6 +170,8 @@ impl ChatApp {
             content: "Thinking…".into(),
             created_at: Local::now(),
             is_thinking: true,
+            is_tool: false,
+            tool_success: None,
             metrics: None,
             trace: None,
         });
@@ -175,7 +184,7 @@ impl ChatApp {
         let turns = self
             .messages
             .iter()
-            .filter(|message| !message.is_thinking)
+            .filter(|message| !message.is_thinking && !message.is_tool)
             .map(|message| ChatTurn {
                 role: if message.author == ASSISTANT_NAME {
                     "assistant".into()
@@ -186,14 +195,19 @@ impl ChatApp {
             })
             .collect::<Vec<_>>();
 
+        let ctx = ctx.clone();
         thread::spawn(move || {
             let (progress_tx, progress_rx) = mpsc::channel();
             let event_tx = tx.clone();
+            let progress_ctx = ctx.clone();
             let progress_handle = thread::spawn(move || {
                 while let Ok(event) = progress_rx.recv() {
                     match event {
                         ChatProgressEvent::Thinking(content) => {
                             let _ = event_tx.send(LlmEvent::Thinking { content });
+                        }
+                        ChatProgressEvent::ToolAction(update) => {
+                            let _ = event_tx.send(LlmEvent::ToolAction { update });
                         }
                         ChatProgressEvent::CommandApprovalNeeded {
                             command,
@@ -205,6 +219,7 @@ impl ChatApp {
                             });
                         }
                     }
+                    progress_ctx.request_repaint();
                 }
             });
 
@@ -224,6 +239,7 @@ impl ChatApp {
                     let _ = tx.send(LlmEvent::Failed { message: err });
                 }
             }
+            ctx.request_repaint();
         });
     }
 
@@ -244,6 +260,41 @@ impl ChatApp {
                 .response_tx
                 .send(Ok("User rejected running this command.".into()));
         }
+    }
+
+    fn push_tool_action(&mut self, update: ToolActionUpdate) {
+        if update.completed {
+            if let Some(index) = self.pending_tool_message_index.take() {
+                if let Some(message) = self.messages.get_mut(index) {
+                    message.content = format_tool_message_content(&update);
+                    message.created_at = Local::now();
+                    message.tool_success = Some(update.success);
+                }
+            }
+            return;
+        }
+
+        let insert_at = self.thinking_message_index.unwrap_or(self.messages.len());
+        self.messages.insert(
+            insert_at,
+            Message {
+                author: format!("Tool · {}", update.name),
+                content: format_tool_message_content(&update),
+                created_at: Local::now(),
+                is_thinking: false,
+                is_tool: true,
+                tool_success: None,
+                metrics: None,
+                trace: None,
+            },
+        );
+        self.pending_tool_message_index = Some(insert_at);
+
+        if let Some(thinking_index) = self.thinking_message_index {
+            self.thinking_message_index = Some(thinking_index + 1);
+        }
+
+        self.scroll_to_bottom = true;
     }
 
     fn remove_thinking_message(&mut self) {
@@ -278,6 +329,9 @@ impl ChatApp {
                         }
                     }
                 }
+                LlmEvent::ToolAction { update } => {
+                    self.push_tool_action(update);
+                }
                 LlmEvent::CommandApprovalNeeded {
                     command,
                     response_tx,
@@ -296,6 +350,8 @@ impl ChatApp {
                         if let Some(message) = self.messages.get_mut(index) {
                             message.content = content;
                             message.is_thinking = false;
+                            message.is_tool = false;
+                            message.tool_success = None;
                             message.created_at = Local::now();
                             message.metrics = Some(metrics);
                             message.trace = Some(trace);
@@ -306,10 +362,13 @@ impl ChatApp {
                             content,
                             created_at: Local::now(),
                             is_thinking: false,
+                            is_tool: false,
+                            tool_success: None,
                             metrics: Some(metrics),
                             trace: Some(trace),
                         });
                     }
+                    self.pending_tool_message_index = None;
                     self.llm_busy = false;
                     self.llm_status = format!("Connected · using {}", self.llm.model);
                     self.scroll_to_bottom = true;
@@ -319,6 +378,7 @@ impl ChatApp {
                         self.remove_thinking_message();
                         self.llm_busy = false;
                     }
+                    self.pending_tool_message_index = None;
                     self.command_prompt = None;
                     self.llm_status = message.clone();
                     self.status = Some(message);
@@ -334,6 +394,10 @@ impl eframe::App for ChatApp {
         self.poll_llm_events(ctx);
         self.show_command_prompt(ctx);
         self.show_details_modal(ctx);
+
+        if self.llm_busy {
+            ctx.request_repaint();
+        }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(8.0);
@@ -526,6 +590,7 @@ impl eframe::App for ChatApp {
                     for message in &self.messages {
                         let is_user = message.author == USER_NAME;
                         let is_assistant = message.author == ASSISTANT_NAME;
+                        let is_tool = message.is_tool;
 
                         ui.horizontal(|ui| {
                             if is_user {
@@ -536,14 +601,17 @@ impl eframe::App for ChatApp {
                                 ui.set_max_width(ui.available_width());
 
                                 ui.horizontal(|ui| {
+                                    let author_label = if message.is_thinking {
+                                        "Assistant (thinking)"
+                                    } else {
+                                        &message.author
+                                    };
                                     ui.label(
-                                        egui::RichText::new(if message.is_thinking {
-                                            "Assistant (thinking)"
-                                        } else {
-                                            &message.author
-                                        })
+                                        egui::RichText::new(author_label)
                                         .strong()
-                                        .color(if is_assistant {
+                                        .color(if is_tool {
+                                            egui::Color32::from_rgb(255, 196, 96)
+                                        } else if is_assistant {
                                             egui::Color32::from_rgb(120, 214, 143)
                                         } else {
                                             egui::Color32::from_rgb(108, 140, 255)
@@ -561,6 +629,8 @@ impl eframe::App for ChatApp {
                                 let frame = egui::Frame::new()
                                     .fill(if is_user {
                                         egui::Color32::from_rgb(36, 48, 74)
+                                    } else if is_tool {
+                                        egui::Color32::from_rgb(44, 36, 24)
                                     } else if is_assistant {
                                         egui::Color32::from_rgb(28, 44, 38)
                                     } else {
@@ -568,20 +638,53 @@ impl eframe::App for ChatApp {
                                     })
                                     .stroke(egui::Stroke::new(
                                         1.0,
-                                        egui::Color32::from_rgb(42, 49, 64),
+                                        if is_tool {
+                                            egui::Color32::from_rgb(255, 196, 96)
+                                        } else {
+                                            egui::Color32::from_rgb(42, 49, 64)
+                                        },
                                     ))
                                     .inner_margin(10.0)
                                     .corner_radius(8.0);
 
                                 frame.show(ui, |ui| {
-                                    let text = if message.is_thinking {
-                                        egui::RichText::new(&message.content)
-                                            .weak()
-                                            .italics()
+                                    if is_tool {
+                                        if let Some((arguments, summary)) =
+                                            message.content.split_once("\n\n")
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(arguments).monospace().weak(),
+                                            );
+                                            ui.add_space(6.0);
+                                            let summary_color = match message.tool_success {
+                                                Some(false) => {
+                                                    egui::Color32::from_rgb(255, 143, 143)
+                                                }
+                                                Some(true) => {
+                                                    egui::Color32::from_rgb(196, 220, 196)
+                                                }
+                                                None => egui::Color32::from_rgb(180, 180, 180),
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(summary)
+                                                    .color(summary_color)
+                                                    .italics(),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(&message.content).monospace(),
+                                            );
+                                        }
                                     } else {
-                                        egui::RichText::new(&message.content)
-                                    };
-                                    ui.label(text);
+                                        let text = if message.is_thinking {
+                                            egui::RichText::new(&message.content)
+                                                .weak()
+                                                .italics()
+                                        } else {
+                                            egui::RichText::new(&message.content)
+                                        };
+                                        ui.label(text);
+                                    }
                                 });
 
                                 if is_assistant && !message.is_thinking {
@@ -723,6 +826,10 @@ impl ChatApp {
                 });
             });
     }
+}
+
+fn format_tool_message_content(update: &ToolActionUpdate) -> String {
+    format!("{}\n\n{}", update.arguments, update.summary)
 }
 
 fn show_json_block(ui: &mut egui::Ui, value: &serde_json::Value, block_id: &str) {

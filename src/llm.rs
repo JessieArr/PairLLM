@@ -1,7 +1,6 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -13,38 +12,139 @@ const DEFAULT_NUM_CTX: u32 = 16384;
 const MAX_TOOL_ROUNDS: usize = 8;
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_COMMAND_OUTPUT: usize = 8000;
-const MAX_READ_FILE_CHARS: usize = 8000;
-const MAX_LIST_ENTRIES: usize = 500;
 const MAX_TOOL_RESULT_CHARS: usize = 4000;
 const MAX_CONTEXT_MESSAGES: usize = 20;
 const MAX_CONTEXT_MESSAGE_CHARS: usize = 3000;
 const KEEP_ALIVE: &str = "30m";
 
-const SYSTEM_PROMPT: &str = "\
-You are a helpful assistant in a chat app.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolPlatform {
+    All,
+    Unix,
+}
 
-You have five tools:
-- web_search: searches the web for up-to-date information.
-- list_files: lists files and directories at a path (like ls).
-- read_file: reads the contents of a file.
-- replace_in_file: replaces a range of lines in a file with new text (1-based, inclusive).
-- run_command: runs a shell command on the user's machine. The user must approve \
-before it runs.
+impl ToolPlatform {
+    fn is_supported(self) -> bool {
+        match self {
+            ToolPlatform::All => true,
+            ToolPlatform::Unix => cfg!(unix),
+        }
+    }
+}
 
-If you need a tool, respond with ONLY a JSON object and nothing else:
-{\"tool\":\"web_search\",\"query\":\"your search query\"}
-{\"tool\":\"list_files\",\"path\":\"/path/to/dir\"}
-{\"tool\":\"read_file\",\"path\":\"/path/to/file\"}
-{\"tool\":\"replace_in_file\",\"path\":\"/path/to/file\",\"start_line\":1,\"end_line\":3,\"text\":\"new content\"}
-{\"tool\":\"run_command\",\"command\":\"the shell command\"}
+struct ToolSpec {
+    name: &'static str,
+    platform: ToolPlatform,
+    prompt_line: &'static str,
+    json_example: &'static str,
+}
 
-After you receive a tool result, answer the user in plain language.";
+const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "web_search",
+        platform: ToolPlatform::All,
+        prompt_line: "- web_search: searches the web for up-to-date information.",
+        json_example: r#"{"tool":"web_search","query":"your search query"}"#,
+    },
+    ToolSpec {
+        name: "ls",
+        platform: ToolPlatform::Unix,
+        prompt_line: "- ls: lists files in a directory, like `ls /path/to/dir`. You choose the \
+directory path and optional flags (a, l, R).",
+        json_example: r#"{"tool":"ls","path":"/path/to/dir","flags":"la"}"#,
+    },
+    ToolSpec {
+        name: "cat",
+        platform: ToolPlatform::Unix,
+        prompt_line: "- cat: prints a file's contents, like `cat /path/to/file`. You choose the file path.",
+        json_example: r#"{"tool":"cat","path":"/path/to/file"}"#,
+    },
+    ToolSpec {
+        name: "sed",
+        platform: ToolPlatform::Unix,
+        prompt_line: "- sed: search-and-replace in a file, like `sed -i 's/pattern/replacement/' file.txt`. \
+You choose the file path and the full sed substitution expression. In the replacement, escape \
+special characters: \\ for backslash, \\& for &, \\/ for / (or use another delimiter), and \\1 etc. \
+for backreferences.",
+        json_example: r#"{"tool":"sed","path":"/path/to/file.txt","expression":"s/old/new/"}"#,
+    },
+    ToolSpec {
+        name: "run_command",
+        platform: ToolPlatform::All,
+        prompt_line: "- run_command: runs a shell command on the user's machine. The user must approve \
+before it runs.",
+        json_example: r#"{"tool":"run_command","command":"the shell command"}"#,
+    },
+];
+
+fn available_tool_specs() -> impl Iterator<Item = &'static ToolSpec> {
+    TOOL_SPECS
+        .iter()
+        .filter(|spec| spec.platform.is_supported())
+}
+
+fn tool_system_prompt_body() -> String {
+    let specs: Vec<_> = available_tool_specs().collect();
+    let count = specs.len();
+    let tool_word = if count == 1 { "tool" } else { "tools" };
+
+    let mut lines = vec![
+        "You are a helpful assistant in a chat app.".into(),
+        String::new(),
+        format!("You have {count} {tool_word}:"),
+    ];
+
+    for spec in &specs {
+        lines.push(spec.prompt_line.to_string());
+    }
+
+    lines.push(String::new());
+    lines.push("If you need a tool, respond with ONLY a JSON object and nothing else:".into());
+    for spec in &specs {
+        lines.push(spec.json_example.to_string());
+    }
+    lines.push(String::new());
+    lines.push("After you receive a tool result, answer the user in plain language.".into());
+    lines.join("\n")
+}
+
+fn operating_system_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "freebsd") {
+        "FreeBSD"
+    } else {
+        "Unknown"
+    }
+}
+
+fn environment_context() -> String {
+    let mut lines = vec![format!("Operating system: {}", operating_system_name())];
+
+    match home_dir() {
+        Some(path) => {
+            lines.push(format!("Home directory: {}", path.display()));
+            lines.push("In file tool paths, `~` expands to this home directory.".into());
+        }
+        None => lines.push("Home directory: (unknown)".into()),
+    }
+
+    lines.join("\n")
+}
 
 fn system_prompt() -> String {
     let now = Local::now()
         .format("%A, %B %d, %Y at %I:%M %p %Z")
         .to_string();
-    format!("Current time: {now}\n\n{SYSTEM_PROMPT}")
+    format!(
+        "Current time: {now}\n{}\n\n{}",
+        environment_context(),
+        tool_system_prompt_body()
+    )
 }
 
 pub struct QwenModelOption {
@@ -219,10 +319,20 @@ pub struct ChatTurn {
 
 pub enum ChatProgressEvent {
     Thinking(String),
+    ToolAction(ToolActionUpdate),
     CommandApprovalNeeded {
         command: String,
         response_tx: Sender<Result<String, String>>,
     },
+}
+
+#[derive(Clone)]
+pub struct ToolActionUpdate {
+    pub name: String,
+    pub arguments: String,
+    pub summary: String,
+    pub success: bool,
+    pub completed: bool,
 }
 
 #[derive(Clone)]
@@ -387,12 +497,17 @@ pub fn chat(
             append_tool_preview(&mut thinking, &invocation);
             thinking.push('…');
             send_thinking(progress_tx, &thinking);
+            send_tool_action(progress_tx, &invocation, None);
 
             let result = if invocation.name == "run_command" {
-                request_command_approval(&invocation, progress_tx, &mut thinking)?
+                request_command_approval(&invocation, progress_tx, &mut thinking)
             } else {
-                execute_tool(&invocation, config)?
+                execute_tool(&invocation, config)
             };
+
+            send_tool_action(progress_tx, &invocation, Some(&result));
+
+            let result = result?;
 
             thinking.push_str("\n\n← ");
             thinking.push_str(&summarize_tool_result(&invocation.name, &result));
@@ -522,6 +637,110 @@ fn send_thinking(progress_tx: &Sender<ChatProgressEvent>, content: &str) {
     let _ = progress_tx.send(ChatProgressEvent::Thinking(content.to_string()));
 }
 
+fn send_tool_action(
+    progress_tx: &Sender<ChatProgressEvent>,
+    invocation: &ToolInvocation,
+    result: Option<&Result<String, String>>,
+) {
+    let arguments = format_tool_arguments(invocation);
+    let update = match result {
+        None => ToolActionUpdate {
+            name: invocation.name.clone(),
+            arguments,
+            summary: "Running…".into(),
+            success: true,
+            completed: false,
+        },
+        Some(Ok(output)) => ToolActionUpdate {
+            name: invocation.name.clone(),
+            arguments,
+            summary: tool_result_summary(&invocation.name, output),
+            success: true,
+            completed: true,
+        },
+        Some(Err(message)) => ToolActionUpdate {
+            name: invocation.name.clone(),
+            arguments,
+            summary: message.clone(),
+            success: false,
+            completed: true,
+        },
+    };
+
+    let _ = progress_tx.send(ChatProgressEvent::ToolAction(update));
+}
+
+fn format_tool_arguments(invocation: &ToolInvocation) -> String {
+    let parsed = normalize_arguments(&invocation.arguments);
+
+    match invocation.name.as_str() {
+        "web_search" => parsed
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|query| format!("query: {query}"))
+            .unwrap_or_else(|| "query: (missing)".into()),
+        "ls" => format_ls_arguments(&parsed),
+        "cat" => format_cat_arguments(&parsed),
+        "sed" => format_sed_arguments(&parsed),
+        "run_command" => command_from_arguments(&parsed)
+            .map(|command| format!("command: {command}"))
+            .unwrap_or_else(|err| err),
+        _ => serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| parsed.to_string()),
+    }
+}
+
+fn tool_result_summary(tool_name: &str, result: &str) -> String {
+    match tool_name {
+        "ls" => {
+            let lines = result.lines().filter(|line| !line.trim().is_empty()).count();
+            if result.contains("… truncated") {
+                format!("{lines} lines of output (truncated)")
+            } else {
+                format!("{lines} lines of output")
+            }
+        }
+        "cat" => {
+            let content = result
+                .split_once("\n\n")
+                .map(|(_, body)| body)
+                .unwrap_or(result);
+            let lines = content.lines().count();
+            if result.contains("… truncated") {
+                format!("{lines} lines read (truncated)")
+            } else {
+                let chars = content.chars().count();
+                format!("{lines} lines, {chars} characters read")
+            }
+        }
+        "sed" => result.to_string(),
+        "web_search" => {
+            if result.contains("No results found.") {
+                return "No results found".into();
+            }
+
+            let count = result
+                .lines()
+                .filter(|line| {
+                    line.chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_digit())
+                })
+                .count();
+            if count == 0 {
+                "Search completed".into()
+            } else {
+                format!("{count} sources")
+            }
+        }
+        "run_command" => result
+            .lines()
+            .next()
+            .map(|line| format!("Completed ({line})"))
+            .unwrap_or_else(|| "Completed".into()),
+        _ => truncate(result, 120),
+    }
+}
+
 fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
     match invocation.name.as_str() {
         "web_search" => {
@@ -529,18 +748,29 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
                 thinking.push_str(&format!(" ({query})"));
             }
         }
-        "list_files" | "read_file" => {
+        "ls" => {
             if let Ok(path) = path_from_arguments(&invocation.arguments) {
-                thinking.push_str(&format!(" ({})", path.display()));
+                let flags = invocation
+                    .arguments
+                    .get("flags")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                thinking.push_str(&format!(" (ls {flags} {})", path.display()));
             }
         }
-        "replace_in_file" => {
+        "cat" => {
             if let Ok(path) = path_from_arguments(&invocation.arguments) {
-                let start = invocation.arguments.get("start_line");
-                let end = invocation.arguments.get("end_line");
+                thinking.push_str(&format!(" (cat {})", path.display()));
+            }
+        }
+        "sed" => {
+            if let (Ok(path), Ok(expression)) = (
+                path_from_arguments(&invocation.arguments),
+                sed_expression_from_arguments(&invocation.arguments),
+            ) {
                 thinking.push_str(&format!(
-                    " ({path} lines {start:?}-{end:?})",
-                    path = path.display()
+                    " (sed -i '{expression}' {})",
+                    path.display()
                 ));
             }
         }
@@ -555,8 +785,8 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
 
 fn summarize_tool_result(tool_name: &str, result: &str) -> String {
     match tool_name {
-        "read_file" | "list_files" | "run_command" | "web_search" => truncate(result, 600),
-        "replace_in_file" => result.to_string(),
+        "cat" | "run_command" | "web_search" => truncate(result, 600),
+        "ls" | "sed" => result.to_string(),
         _ => truncate(result, 600),
     }
 }
@@ -708,9 +938,9 @@ fn http_client() -> &'static reqwest::blocking::Client {
     CLIENT.get_or_init(reqwest::blocking::Client::new)
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
+fn tool_definition(spec: &ToolSpec) -> Value {
+    match spec.name {
+        "web_search" => json!({
             "type": "function",
             "function": {
                 "name": "web_search",
@@ -727,45 +957,49 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-        json!({
+        "ls" => json!({
             "type": "function",
             "function": {
-                "name": "list_files",
-                "description": "List files and directories at a path, similar to ls",
+                "name": "ls",
+                "description": "List files in a directory using ls. Optional flags: a (all), l (long), R (recursive).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Directory path to list"
+                        },
+                        "flags": {
+                            "type": "string",
+                            "description": "Optional ls flags as a string using a, l, and/or R (e.g. \"la\" or \"-laR\")"
                         }
                     },
                     "required": ["path"]
                 }
             }
         }),
-        json!({
+        "cat" => json!({
             "type": "function",
             "function": {
-                "name": "read_file",
-                "description": "Read the contents of a text file",
+                "name": "cat",
+                "description": "Print a file's contents using cat, like cat /path/to/file",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "File path to read"
+                            "description": "File path to print"
                         }
                     },
                     "required": ["path"]
                 }
             }
         }),
-        json!({
+        "sed" => json!({
             "type": "function",
             "function": {
-                "name": "replace_in_file",
-                "description": "Replace a range of lines in a file with new text. Line numbers are 1-based and inclusive.",
+                "name": "sed",
+                "description": "Search-and-replace in a file using sed. In the replacement portion of the expression, escape special characters: backslash, &, the delimiter, and backreferences (e.g. \\\\&, \\/, \\\\1).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -773,24 +1007,16 @@ fn tool_definitions() -> Vec<Value> {
                             "type": "string",
                             "description": "File path to modify"
                         },
-                        "start_line": {
-                            "type": "integer",
-                            "description": "First line to replace (1-based, inclusive)"
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": "Last line to replace (1-based, inclusive)"
-                        },
-                        "text": {
+                        "expression": {
                             "type": "string",
-                            "description": "Replacement text (may span multiple lines)"
+                            "description": "Full sed substitution expression (e.g. s/old/new/ or s/old/new/g). Escape \\, &, /, and backreferences in the replacement."
                         }
                     },
-                    "required": ["path", "start_line", "end_line", "text"]
+                    "required": ["path", "expression"]
                 }
             }
         }),
-        json!({
+        "run_command" => json!({
             "type": "function",
             "function": {
                 "name": "run_command",
@@ -807,15 +1033,22 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+        _ => json!({}),
+    }
+}
+
+fn tool_definitions() -> Vec<Value> {
+    available_tool_specs()
+        .map(tool_definition)
+        .collect()
 }
 
 fn execute_tool(invocation: &ToolInvocation, config: &LlmConfig) -> Result<String, String> {
     match invocation.name.as_str() {
         "web_search" => web_search(config, &invocation.arguments),
-        "list_files" => list_files(&invocation.arguments),
-        "read_file" => read_file(&invocation.arguments),
-        "replace_in_file" => replace_in_file(&invocation.arguments),
+        "ls" => ls(&invocation.arguments),
+        "cat" => cat(&invocation.arguments),
+        "sed" => sed(&invocation.arguments),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -851,149 +1084,275 @@ fn expand_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-fn usize_from_value(value: &Value, field: &str) -> Result<usize, String> {
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .filter(|n| *n >= 1)
-            .map(|n| n as usize)
-            .ok_or_else(|| format!("\"{field}\" must be a positive integer.")),
-        Value::String(text) => text
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n >= 1)
-            .ok_or_else(|| format!("\"{field}\" must be a positive integer.")),
-        _ => Err(format!("\"{field}\" must be a positive integer.")),
+fn require_file_exists(path: &PathBuf) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", path.display()));
     }
-}
-
-fn list_files(arguments: &Value) -> Result<String, String> {
-    let path = path_from_arguments(arguments)?;
-    let entries = fs::read_dir(&path)
-        .map_err(|err| format!("Could not list {}: {err}", path.display()))?;
-
-    let mut lines = vec![format!("Listing {}:", path.display())];
-    let mut count = 0;
-
-    for entry in entries {
-        if count >= MAX_LIST_ENTRIES {
-            lines.push(format!("… truncated after {MAX_LIST_ENTRIES} entries"));
-            break;
-        }
-
-        let entry = entry.map_err(|err| format!("Could not read directory entry: {err}"))?;
-        let file_type = entry.file_type().map_err(|err| err.to_string())?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let kind = if file_type.is_dir() {
-            "DIR"
-        } else if file_type.is_symlink() {
-            "LINK"
-        } else {
-            "FILE"
-        };
-
-        let detail = if file_type.is_file() {
-            entry
-                .metadata()
-                .ok()
-                .map(|meta| format!("{} bytes", meta.len()))
-                .unwrap_or_else(|| "unknown size".into())
-        } else {
-            String::new()
-        };
-
-        if detail.is_empty() {
-            lines.push(format!("  [{kind}]  {name}"));
-        } else {
-            lines.push(format!("  [{kind}]  {name} ({detail})"));
-        }
-
-        count += 1;
-    }
-
-    if count == 0 {
-        lines.push("  (empty directory)".into());
-    }
-
-    Ok(lines.join("\n"))
-}
-
-fn read_file(arguments: &Value) -> Result<String, String> {
-    let path = path_from_arguments(arguments)?;
-
     if !path.is_file() {
         return Err(format!("Not a file: {}", path.display()));
     }
-
-    let content = fs::read_to_string(&path)
-        .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
-
-    if content.chars().count() > MAX_READ_FILE_CHARS {
-        Ok(format!(
-            "{}\n\n… truncated (file exceeds {MAX_READ_FILE_CHARS} characters)",
-            truncate(&content, MAX_READ_FILE_CHARS)
-        ))
-    } else {
-        Ok(content)
-    }
+    Ok(())
 }
 
-fn replace_in_file(arguments: &Value) -> Result<String, String> {
+fn require_directory_exists(path: &PathBuf) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("Directory does not exist: {}", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("Not a directory: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn sed_expression_from_arguments(arguments: &Value) -> Result<String, String> {
     let parsed = normalize_arguments(arguments);
-    let path = path_from_arguments(&parsed)?;
-    let start_line = parsed
-        .get("start_line")
-        .ok_or("replace_in_file requires \"start_line\".")?;
-    let end_line = parsed
-        .get("end_line")
-        .ok_or("replace_in_file requires \"end_line\".")?;
-    let start_line = usize_from_value(start_line, "start_line")?;
-    let end_line = usize_from_value(end_line, "end_line")?;
-
-    if start_line > end_line {
-        return Err("start_line must be less than or equal to end_line.".into());
-    }
-
-    let text = parsed
-        .get("text")
+    parsed
+        .get("expression")
         .and_then(Value::as_str)
-        .ok_or("replace_in_file requires \"text\".")?;
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())
+        .ok_or("sed requires \"expression\" (e.g. s/old/new/).".into())
+        .map(str::to_string)
+}
 
-    if !path.is_file() {
-        return Err(format!("Not a file: {}", path.display()));
+fn validate_sed_expression(expression: &str) -> Result<(), String> {
+    if expression.contains('\n') {
+        return Err("sed expression must be a single line.".into());
+    }
+    if expression.starts_with('-') {
+        return Err("sed expression must not start with '-'.".into());
+    }
+    Ok(())
+}
+
+fn format_sed_command(path: &PathBuf, expression: &str) -> String {
+    format!("sed -i '{expression}' {}", path.display())
+}
+
+fn format_sed_arguments(arguments: &Value) -> String {
+    match (
+        path_from_arguments(arguments),
+        sed_expression_from_arguments(arguments),
+    ) {
+        (Ok(path), Ok(expression)) => {
+            format!(
+                "command: {}\nexpression: {expression}\npath: {}",
+                format_sed_command(&path, &expression),
+                path.display()
+            )
+        }
+        (Err(err), _) | (_, Err(err)) => err,
+    }
+}
+
+fn parse_ls_flags(flags: Option<&str>) -> Result<String, String> {
+    let Some(raw) = flags.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(String::new());
+    };
+
+    let raw = raw.trim_start_matches('-');
+    let mut has_a = false;
+    let mut has_l = false;
+    let mut has_r = false;
+
+    for ch in raw.chars() {
+        match ch {
+            'a' => has_a = true,
+            'l' => has_l = true,
+            'R' => has_r = true,
+            _ => {
+                return Err(format!(
+                    "Unsupported ls flag: {ch}. Only a, l, and R are supported."
+                ));
+            }
+        }
     }
 
-    let original = fs::read_to_string(&path)
-        .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
-    let trailing_newline = original.ends_with('\n');
-    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
-
-    if start_line > lines.len() {
-        return Err(format!(
-            "start_line {start_line} is beyond end of file ({} lines).",
-            lines.len()
-        ));
+    let mut flag_chars = String::new();
+    if has_a {
+        flag_chars.push('a');
+    }
+    if has_l {
+        flag_chars.push('l');
+    }
+    if has_r {
+        flag_chars.push('R');
     }
 
-    let end_index = end_line.min(lines.len());
-    let removed = end_index - start_line + 1;
-    let replacement: Vec<String> = text.lines().map(str::to_string).collect();
-    let inserted = replacement.len();
-    lines.splice((start_line - 1)..end_index, replacement);
+    Ok(flag_chars)
+}
 
-    let mut updated = lines.join("\n");
-    if trailing_newline && !updated.is_empty() {
-        updated.push('\n');
+fn format_ls_command(path: &PathBuf, flags: &str) -> String {
+    if flags.is_empty() {
+        format!("ls {}", path.display())
+    } else {
+        format!("ls -{flags} {}", path.display())
+    }
+}
+
+fn format_ls_arguments(arguments: &Value) -> String {
+    let parsed = normalize_arguments(arguments);
+    match (
+        path_from_arguments(&parsed),
+        parse_ls_flags(parsed.get("flags").and_then(Value::as_str)),
+    ) {
+        (Ok(path), Ok(flags)) => {
+            let mut lines = vec![format!(
+                "command: {}",
+                format_ls_command(&path, &flags)
+            )];
+            lines.push(format!("path: {}", path.display()));
+            if flags.is_empty() {
+                lines.push("flags: (none)".into());
+            } else {
+                lines.push(format!("flags: {flags}"));
+            }
+            lines.join("\n")
+        }
+        (Err(err), _) | (_, Err(err)) => err,
+    }
+}
+
+fn ls(arguments: &Value) -> Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = arguments;
+        return Err("The ls tool is only available on Linux and macOS.".into());
     }
 
-    fs::write(&path, &updated)
-        .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let parsed = normalize_arguments(arguments);
+        let path = path_from_arguments(&parsed)?;
+        let flags = parse_ls_flags(parsed.get("flags").and_then(Value::as_str))?;
+        require_directory_exists(&path)?;
 
-    Ok(format!(
-        "Replaced lines {start_line}-{end_line} in {} ({removed} line(s) -> {inserted} line(s)).",
-        path.display()
-    ))
+        let command_label = format_ls_command(&path, &flags);
+        let mut command = Command::new("ls");
+        if !flags.is_empty() {
+            command.arg(format!("-{flags}"));
+        }
+        command.arg(&path);
+
+        let output = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| format!("Could not run ls: {err}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err(format!("ls failed for {command_label}"));
+            }
+            return Err(format!("ls failed for {command_label}: {stderr}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Ok(format!("{command_label}\n\n(empty directory)"));
+        }
+
+        Ok(truncate(
+            &format!("{command_label}\n\n{}", stdout.trim_end()),
+            MAX_COMMAND_OUTPUT,
+        ))
+    }
+}
+
+fn sed(arguments: &Value) -> Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = arguments;
+        return Err("The sed tool is only available on Linux and macOS.".into());
+    }
+
+    #[cfg(unix)]
+    {
+        let parsed = normalize_arguments(arguments);
+        let path = path_from_arguments(&parsed)?;
+        let expression = sed_expression_from_arguments(&parsed)?;
+        validate_sed_expression(&expression)?;
+        require_file_exists(&path)?;
+
+        let command_label = format_sed_command(&path, &expression);
+        let path_arg = path.to_string_lossy().into_owned();
+        let output = if cfg!(target_os = "macos") {
+            Command::new("sed")
+                .args(["-i", "", &expression, &path_arg])
+                .output()
+        } else {
+            Command::new("sed")
+                .args(["-i", &expression, &path_arg])
+                .output()
+        }
+        .map_err(|err| format!("Could not run sed: {err}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err(format!("sed failed for {command_label}"));
+            }
+            return Err(format!("sed failed for {command_label}: {stderr}"));
+        }
+
+        Ok(format!("Applied {command_label} successfully."))
+    }
+}
+
+fn format_cat_command(path: &PathBuf) -> String {
+    format!("cat {}", path.display())
+}
+
+fn format_cat_arguments(arguments: &Value) -> String {
+    match path_from_arguments(arguments) {
+        Ok(path) => format!(
+            "command: {}\npath: {}",
+            format_cat_command(&path),
+            path.display()
+        ),
+        Err(err) => err,
+    }
+}
+
+fn cat(arguments: &Value) -> Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = arguments;
+        return Err("The cat tool is only available on Linux and macOS.".into());
+    }
+
+    #[cfg(unix)]
+    {
+        let path = path_from_arguments(arguments)?;
+        require_file_exists(&path)?;
+
+        let command_label = format_cat_command(&path);
+        let output = Command::new("cat")
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| format!("Could not run cat: {err}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err(format!("cat failed for {command_label}"));
+            }
+            return Err(format!("cat failed for {command_label}: {stderr}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.is_empty() {
+            return Ok(format!("{command_label}\n\n(empty file)"));
+        }
+
+        Ok(truncate(
+            &format!("{command_label}\n\n{}", stdout.trim_end()),
+            MAX_COMMAND_OUTPUT,
+        ))
+    }
 }
 
 fn web_search(config: &LlmConfig, arguments: &Value) -> Result<String, String> {
@@ -1120,7 +1479,7 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
                 .unwrap_or(Value::Null);
             json!({ "command": command })
         }
-        "list_files" | "read_file" => {
+        "cat" => {
             let path = value
                 .get("path")
                 .or_else(|| value.pointer("/arguments/path"))
@@ -1128,12 +1487,16 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
                 .unwrap_or(Value::Null);
             json!({ "path": path })
         }
-        "replace_in_file" => {
+        "ls" => {
             json!({
                 "path": value.get("path").or_else(|| value.pointer("/arguments/path")).cloned().unwrap_or(Value::Null),
-                "start_line": value.get("start_line").or_else(|| value.pointer("/arguments/start_line")).cloned().unwrap_or(Value::Null),
-                "end_line": value.get("end_line").or_else(|| value.pointer("/arguments/end_line")).cloned().unwrap_or(Value::Null),
-                "text": value.get("text").or_else(|| value.pointer("/arguments/text")).cloned().unwrap_or(Value::Null),
+                "flags": value.get("flags").or_else(|| value.pointer("/arguments/flags")).cloned().unwrap_or(Value::Null),
+            })
+        }
+        "sed" => {
+            json!({
+                "path": value.get("path").or_else(|| value.pointer("/arguments/path")).cloned().unwrap_or(Value::Null),
+                "expression": value.get("expression").or_else(|| value.pointer("/arguments/expression")).cloned().unwrap_or(Value::Null),
             })
         }
         _ => json!({}),
@@ -1154,10 +1517,9 @@ fn normalize_arguments(arguments: &Value) -> Value {
 }
 
 fn is_supported_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "web_search" | "list_files" | "read_file" | "replace_in_file" | "run_command"
-    )
+    TOOL_SPECS
+        .iter()
+        .any(|spec| spec.name == name && spec.platform.is_supported())
 }
 
 fn json_candidates(text: &str) -> Vec<String> {
@@ -1196,6 +1558,61 @@ fn connection_error(err: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn ls_availability_matches_platform() {
+        assert_eq!(is_supported_tool("ls"), cfg!(unix));
+    }
+
+    #[test]
+    fn cat_availability_matches_platform() {
+        assert_eq!(is_supported_tool("cat"), cfg!(unix));
+    }
+
+    #[test]
+    fn parses_ls_flags() {
+        assert_eq!(parse_ls_flags(Some("la")).expect("flags"), "al");
+        assert_eq!(parse_ls_flags(Some("-aR")).expect("flags"), "aR");
+        assert_eq!(parse_ls_flags(None).expect("flags"), "");
+        assert!(parse_ls_flags(Some("x")).is_err());
+    }
+
+    #[test]
+    fn system_prompt_includes_environment_context() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("Operating system:"));
+        assert!(prompt.contains(operating_system_name()));
+        if let Some(home) = home_dir() {
+            assert!(prompt.contains(&home.display().to_string()));
+        }
+        assert!(prompt.contains("Home directory:"));
+    }
+
+    #[test]
+    fn system_prompt_lists_only_available_tools() {
+        let prompt = tool_system_prompt_body();
+        if cfg!(unix) {
+            assert!(prompt.contains("\"tool\":\"ls\""));
+            assert!(prompt.contains("\"tool\":\"cat\""));
+            assert!(prompt.contains("sed"));
+        } else {
+            assert!(!prompt.contains("\"tool\":\"ls\""));
+            assert!(!prompt.contains("\"tool\":\"cat\""));
+            assert!(!prompt.contains("\"tool\":\"sed\""));
+        }
+    }
+
+    #[test]
+    fn sed_availability_matches_platform() {
+        assert_eq!(is_supported_tool("sed"), cfg!(unix));
+    }
+
+    #[test]
+    fn summarizes_ls_result() {
+        let output = "ls -la /tmp\n\nfile1\nfile2\n";
+        assert_eq!(tool_result_summary("ls", output), "3 lines of output");
+    }
 
     #[test]
     fn formats_metrics_summary() {
@@ -1231,21 +1648,58 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_list_files_request() {
-        let request = parse_tool_request(r#"{"tool":"list_files","path":"."}"#, &[]);
+    fn parses_json_ls_request() {
+        let request = parse_tool_request(r#"{"tool":"ls","path":".","flags":"la"}"#, &[]);
         let invocation = request.expect("tool request");
-        assert_eq!(invocation.name, "list_files");
+        assert_eq!(invocation.name, "ls");
         assert_eq!(
             invocation.arguments.get("path").and_then(Value::as_str),
             Some(".")
         );
+        assert_eq!(
+            invocation.arguments.get("flags").and_then(Value::as_str),
+            Some("la")
+        );
     }
 
     #[test]
-    fn parses_json_read_file_request() {
-        let request = parse_tool_request(r#"{"tool":"read_file","path":"README.md"}"#, &[]);
+    #[cfg(unix)]
+    fn ls_lists_directory() {
+        let dir = std::env::temp_dir().join(format!("pairllm-ls-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        fs::write(dir.join("alpha.txt"), "a").expect("write file");
+
+        let result = ls(&json!({ "path": dir })).expect("ls");
+        assert!(result.contains("alpha.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarizes_cat_result() {
+        assert_eq!(
+            tool_result_summary("cat", "cat /tmp/file\n\none\ntwo\nthree"),
+            "3 lines, 13 characters read"
+        );
+    }
+
+    #[test]
+    fn formats_tool_arguments_for_cat() {
+        let invocation = ToolInvocation {
+            name: "cat".into(),
+            arguments: json!({ "path": "~/notes.txt" }),
+        };
+        let args = format_tool_arguments(&invocation);
+        assert!(args.starts_with("command: cat "));
+        assert!(args.contains("notes.txt"));
+    }
+
+    #[test]
+    fn parses_json_cat_request() {
+        let request = parse_tool_request(r#"{"tool":"cat","path":"README.md"}"#, &[]);
         let invocation = request.expect("tool request");
-        assert_eq!(invocation.name, "read_file");
+        assert_eq!(invocation.name, "cat");
         assert_eq!(
             invocation.arguments.get("path").and_then(Value::as_str),
             Some("README.md")
@@ -1253,21 +1707,76 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_replace_in_file_request() {
+    fn parses_json_sed_request() {
         let request = parse_tool_request(
-            r#"{"tool":"replace_in_file","path":"src/main.rs","start_line":1,"end_line":2,"text":"fn main() {}"}"#,
+            r#"{"tool":"sed","path":"src/main.rs","expression":"s/old/new/"}"#,
             &[],
         );
         let invocation = request.expect("tool request");
-        assert_eq!(invocation.name, "replace_in_file");
+        assert_eq!(invocation.name, "sed");
         assert_eq!(
             invocation.arguments.get("path").and_then(Value::as_str),
             Some("src/main.rs")
         );
         assert_eq!(
-            invocation.arguments.get("text").and_then(Value::as_str),
-            Some("fn main() {}")
+            invocation.arguments.get("expression").and_then(Value::as_str),
+            Some("s/old/new/")
         );
+    }
+
+    #[test]
+    fn cat_errors_when_file_missing() {
+        let result = cat(&json!({ "path": "/tmp/pairllm-definitely-missing-file" }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("File does not exist"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cat_reads_file() {
+        let dir = std::env::temp_dir().join(format!("pairllm-cat-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.txt");
+        fs::write(&path, "hello world\n").expect("write sample");
+
+        let result = cat(&json!({ "path": path })).expect("cat");
+        assert!(result.starts_with("cat "));
+        assert!(result.contains("hello world"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sed_replaces_text_in_file() {
+        let dir = std::env::temp_dir().join(format!("pairllm-sed-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.txt");
+        fs::write(&path, "hello old world\n").expect("write sample");
+
+        let result = sed(&json!({
+            "path": path,
+            "expression": "s/old/new/"
+        }))
+        .expect("sed");
+
+        assert!(result.contains("sed -i 's/old/new/'"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "hello new world\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sed_errors_when_file_missing() {
+        let result = sed(&json!({
+            "path": "/tmp/pairllm-definitely-missing-file",
+            "expression": "s/old/new/"
+        }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("File does not exist"));
     }
 
     #[test]
@@ -1282,28 +1791,6 @@ mod tests {
             expand_path("/etc/hosts").expect("expand"),
             PathBuf::from("/etc/hosts")
         );
-    }
-
-    #[test]
-    fn replace_in_file_replaces_line_range() {
-        let dir = std::env::temp_dir().join(format!("pairllm-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("sample.txt");
-        fs::write(&path, "line1\nline2\nline3\n").expect("write sample");
-
-        let result = replace_in_file(&json!({
-            "path": path,
-            "start_line": 2,
-            "end_line": 2,
-            "text": "replaced"
-        }))
-        .expect("replace");
-
-        assert!(result.contains("Replaced lines 2-2"));
-        assert_eq!(fs::read_to_string(&path).expect("read"), "line1\nreplaced\nline3\n");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -50,9 +50,12 @@ The assistant can call tools when it needs extra information. The current local 
 | Tool | Purpose | JSON request |
 |------|---------|--------------|
 | `web_search` | Web search via [Tavily](https://tavily.com) | `{"tool":"web_search","query":"your search"}` |
-| `list_files` | List files in a directory (like `ls`) | `{"tool":"list_files","path":"/path/to/dir"}` |
-| `read_file` | Read a text file | `{"tool":"read_file","path":"/path/to/file"}` |
-| `replace_in_file` | Replace a line range in a file (1-based, inclusive) | `{"tool":"replace_in_file","path":"/path/to/file","start_line":1,"end_line":3,"text":"new content"}` |
+| `ls` | List files in a directory (Linux/macOS only; optional flags `a`, `l`, `R`) | `{"tool":"ls","path":"/path/to/dir","flags":"la"}` |
+| `cat` | Print a file's contents (Linux/macOS only) | `{"tool":"cat","path":"/path/to/file"}` |
+| `sed` | Search-and-replace in a file (like `sed -i 's/pattern/replacement/' file.txt`; Linux/macOS only). Escape `\`, `&`, `/`, and backreferences in the replacement. | `{"tool":"sed","path":"/path/to/file.txt","expression":"s/old/new/"}` |
+
+Some tools are platform-specific. On Windows, `ls`, `cat`, and `sed` are omitted from the tool list exposed to the model.
+
 | `run_command` | Run a shell command (requires approval) | `{"tool":"run_command","command":"ls -la"}` |
 
 The app runs tools locally (or calls Tavily), sends the result back to the model, and then the model answers the user. **CLI commands are never run automatically** — you must approve them in a confirmation dialog first.
