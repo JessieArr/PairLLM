@@ -61,8 +61,10 @@ directory path and optional flags (a, l, R).",
     ToolSpec {
         name: "cat",
         platform: ToolPlatform::Unix,
-        prompt_line: "- cat: prints a file's contents, like `cat /path/to/file`. You choose the file path.",
-        json_example: r#"{"tool":"cat","path":"/path/to/file"}"#,
+        prompt_line: "- cat: prints a file's contents, like `cat /path/to/file`. Optional flags: n (line numbers). \
+When looking for something specific in a file, pass a grep-style pattern and use flags \"n\" \
+so you know which lines matched.",
+        json_example: r#"{"tool":"cat","path":"/path/to/file","pattern":"fn main","flags":"n"}"#,
     },
     ToolSpec {
         name: "sed",
@@ -871,7 +873,22 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
         }
         "cat" => {
             if let Ok(path) = path_from_arguments(&invocation.arguments) {
-                thinking.push_str(&format!(" (cat {})", path.display()));
+                let flags = invocation
+                    .arguments
+                    .get("flags")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(pattern) = grep_pattern_from_arguments(&invocation.arguments) {
+                    if flags.contains('n') {
+                        thinking.push_str(&format!(" (grep -n '{pattern}' {})", path.display()));
+                    } else {
+                        thinking.push_str(&format!(" (grep '{pattern}' {})", path.display()));
+                    }
+                } else if flags.contains('n') {
+                    thinking.push_str(&format!(" (cat -n {})", path.display()));
+                } else {
+                    thinking.push_str(&format!(" (cat {})", path.display()));
+                }
             }
         }
         "sed" => {
@@ -1093,13 +1110,21 @@ fn tool_definition(spec: &ToolSpec) -> Value {
             "type": "function",
             "function": {
                 "name": "cat",
-                "description": "Print a file's contents using cat, like cat /path/to/file",
+                "description": "Print a file's contents using cat, like cat /path/to/file. Optional flag n adds line numbers (cat -n). When looking for something specific in a file, pass a grep-style pattern and use flags \"n\" so you know which lines matched.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "File path to print"
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Optional grep-style regex; when set, only matching lines are returned"
+                        },
+                        "flags": {
+                            "type": "string",
+                            "description": "Optional cat flags as a string (e.g. \"n\" or \"-n\" for line numbers). Use with pattern when searching for something specific."
                         }
                     },
                     "required": ["path"]
@@ -1425,18 +1450,76 @@ fn sed(arguments: &Value) -> Result<String, String> {
     }
 }
 
-fn format_cat_command(path: &PathBuf) -> String {
-    format!("cat {}", path.display())
+fn parse_cat_flags(flags: Option<&str>) -> Result<String, String> {
+    let Some(raw) = flags.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(String::new());
+    };
+
+    let raw = raw.trim_start_matches('-');
+    let mut has_n = false;
+
+    for ch in raw.chars() {
+        match ch {
+            'n' => has_n = true,
+            _ => {
+                return Err(format!(
+                    "Unsupported cat flag: {ch}. Only n is supported."
+                ));
+            }
+        }
+    }
+
+    if has_n {
+        Ok("n".into())
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn grep_pattern_from_arguments(arguments: &Value) -> Option<String> {
+    let parsed = normalize_arguments(arguments);
+    parsed
+        .get("pattern")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_string)
+}
+
+fn format_cat_command(path: &PathBuf, pattern: Option<&str>, flags: &str) -> String {
+    let line_numbers = flags.contains('n');
+    match pattern {
+        Some(pattern) if line_numbers => format!("grep -n '{}' {}", pattern, path.display()),
+        Some(pattern) => format!("grep '{}' {}", pattern, path.display()),
+        None if line_numbers => format!("cat -n {}", path.display()),
+        None => format!("cat {}", path.display()),
+    }
 }
 
 fn format_cat_arguments(arguments: &Value) -> String {
-    match path_from_arguments(arguments) {
-        Ok(path) => format!(
-            "command: {}\npath: {}",
-            format_cat_command(&path),
-            path.display()
-        ),
-        Err(err) => err,
+    let parsed = normalize_arguments(arguments);
+    match (
+        path_from_arguments(&parsed),
+        parse_cat_flags(parsed.get("flags").and_then(Value::as_str)),
+    ) {
+        (Ok(path), Ok(flags)) => {
+            let pattern = grep_pattern_from_arguments(&parsed);
+            let mut lines = vec![format!(
+                "command: {}",
+                format_cat_command(&path, pattern.as_deref(), &flags)
+            )];
+            lines.push(format!("path: {}", path.display()));
+            if let Some(pattern) = pattern {
+                lines.push(format!("pattern: {pattern}"));
+            }
+            if flags.is_empty() {
+                lines.push("flags: (none)".into());
+            } else {
+                lines.push(format!("flags: {flags}"));
+            }
+            lines.join("\n")
+        }
+        (Err(err), _) | (_, Err(err)) => err,
     }
 }
 
@@ -1449,28 +1532,58 @@ fn cat(arguments: &Value) -> Result<String, String> {
 
     #[cfg(unix)]
     {
-        let path = path_from_arguments(arguments)?;
+        let parsed = normalize_arguments(arguments);
+        let path = path_from_arguments(&parsed)?;
         require_file_exists(&path)?;
 
-        let command_label = format_cat_command(&path);
-        let output = Command::new("cat")
-            .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|err| format!("Could not run cat: {err}"))?;
+        let pattern = grep_pattern_from_arguments(&parsed);
+        let flags = parse_cat_flags(parsed.get("flags").and_then(Value::as_str))?;
+        let line_numbers = flags.contains('n');
+        let command_label = format_cat_command(&path, pattern.as_deref(), &flags);
+        let output = if let Some(pattern) = &pattern {
+            let mut command = Command::new("grep");
+            if line_numbers {
+                command.arg("-n");
+            }
+            command
+                .arg(pattern)
+                .arg(&path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|err| format!("Could not run grep: {err}"))?
+        } else {
+            let mut command = Command::new("cat");
+            if line_numbers {
+                command.arg("-n");
+            }
+            command
+                .arg(&path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|err| format!("Could not run cat: {err}"))?
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                return Err(format!("cat failed for {command_label}"));
+            if pattern.is_some() && output.status.code() == Some(1) && stderr.is_empty() {
+                return Ok(format!("{command_label}\n\n(no matching lines)"));
             }
-            return Err(format!("cat failed for {command_label}: {stderr}"));
+            if stderr.is_empty() {
+                return Err(format!("{command_label} failed"));
+            }
+            return Err(format!("{command_label} failed: {stderr}"));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.is_empty() {
-            return Ok(format!("{command_label}\n\n(empty file)"));
+            let empty_message = if pattern.is_some() {
+                "(no matching lines)"
+            } else {
+                "(empty file)"
+            };
+            return Ok(format!("{command_label}\n\n{empty_message}"));
         }
 
         Ok(truncate(
@@ -1605,12 +1718,11 @@ fn tool_from_json(value: &Value) -> Option<ToolInvocation> {
             json!({ "command": command })
         }
         "cat" => {
-            let path = value
-                .get("path")
-                .or_else(|| value.pointer("/arguments/path"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            json!({ "path": path })
+            json!({
+                "path": value.get("path").or_else(|| value.pointer("/arguments/path")).cloned().unwrap_or(Value::Null),
+                "pattern": value.get("pattern").or_else(|| value.pointer("/arguments/pattern")).cloned().unwrap_or(Value::Null),
+                "flags": value.get("flags").or_else(|| value.pointer("/arguments/flags")).cloned().unwrap_or(Value::Null),
+            })
         }
         "ls" => {
             json!({
@@ -1872,6 +1984,73 @@ mod tests {
         assert!(result.contains("hello world"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cat_filters_lines_with_pattern() {
+        let dir = std::env::temp_dir().join(format!("pairllm-cat-grep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sample.txt");
+        fs::write(
+            &path,
+            "alpha\nbeta line\nalpha again\ngamma\n",
+        )
+        .expect("write sample");
+
+        let result = cat(&json!({ "path": path, "pattern": "alpha" })).expect("cat with pattern");
+        assert!(result.starts_with("grep 'alpha' "));
+        assert!(result.contains("alpha"));
+        assert!(result.contains("alpha again"));
+        assert!(!result.contains("beta line"));
+        assert!(!result.contains("gamma"));
+
+        let no_match = cat(&json!({ "path": path, "pattern": "missing" })).expect("cat with pattern");
+        assert!(no_match.contains("(no matching lines)"));
+
+        let numbered = cat(&json!({ "path": path, "pattern": "alpha", "flags": "n" }))
+            .expect("cat with pattern and line numbers");
+        assert!(numbered.starts_with("grep -n 'alpha' "));
+        assert!(numbered.contains("1:alpha"));
+        assert!(numbered.contains("3:alpha again"));
+
+        let numbered_full = cat(&json!({ "path": path, "flags": "n" })).expect("cat -n");
+        assert!(numbered_full.starts_with("cat -n "));
+        assert!(numbered_full.contains("1\talpha"));
+        assert!(numbered_full.contains("2\tbeta line"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_cat_flags() {
+        assert_eq!(parse_cat_flags(Some("n")).expect("flags"), "n");
+        assert_eq!(parse_cat_flags(Some("-n")).expect("flags"), "n");
+        assert_eq!(parse_cat_flags(None).expect("flags"), "");
+        assert!(parse_cat_flags(Some("x")).is_err());
+    }
+
+    #[test]
+    fn parses_json_cat_request_with_pattern() {
+        let request = parse_tool_request(
+            r#"{"tool":"cat","path":"README.md","pattern":"fn main","flags":"n"}"#,
+            &[],
+        );
+        let invocation = request.expect("tool request");
+        assert_eq!(invocation.name, "cat");
+        assert_eq!(
+            invocation.arguments.get("path").and_then(Value::as_str),
+            Some("README.md")
+        );
+        assert_eq!(
+            invocation.arguments.get("pattern").and_then(Value::as_str),
+            Some("fn main")
+        );
+        assert_eq!(
+            invocation.arguments.get("flags").and_then(Value::as_str),
+            Some("n")
+        );
     }
 
     #[test]
