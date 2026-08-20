@@ -1,8 +1,13 @@
 use chrono::Local;
+use crate::permissions::{
+    self, FileAccess, FilePermissionChoice, PathPermissionRule, PermissionCheck,
+    SharedPathPermissions, check_path_permission, file_access_for_tool,
+    is_file_permission_tool, permission_directory_for_target,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc::{self, Sender}, OnceLock};
 
@@ -180,6 +185,8 @@ pub struct LlmConfig {
     pub model: String,
     pub num_ctx: u32,
     pub tavily_api_key: String,
+    #[serde(default)]
+    pub path_permissions: Vec<PathPermissionRule>,
 }
 
 impl Default for LlmConfig {
@@ -190,6 +197,7 @@ impl Default for LlmConfig {
             model: DEFAULT_MODEL.into(),
             num_ctx: DEFAULT_NUM_CTX,
             tavily_api_key: std::env::var("TAVILY_API_KEY").unwrap_or_default(),
+            path_permissions: Vec::new(),
         }
     }
 }
@@ -324,6 +332,13 @@ pub enum ChatProgressEvent {
         command: String,
         response_tx: Sender<Result<String, String>>,
     },
+    FilePermissionNeeded {
+        tool_name: String,
+        arguments: String,
+        directory: String,
+        access: FileAccess,
+        response_tx: Sender<FilePermissionChoice>,
+    },
 }
 
 #[derive(Clone)]
@@ -451,6 +466,7 @@ pub fn chat(
     config: &LlmConfig,
     messages: &[ChatTurn],
     progress_tx: &Sender<ChatProgressEvent>,
+    permissions: &SharedPathPermissions,
 ) -> Result<ChatResult, String> {
     let messages = trim_context_messages(messages);
 
@@ -501,13 +517,24 @@ pub fn chat(
 
             let result = if invocation.name == "run_command" {
                 request_command_approval(&invocation, progress_tx, &mut thinking)
+            } else if is_file_permission_tool(&invocation.name) {
+                execute_file_tool_with_permission(
+                    &invocation,
+                    config,
+                    permissions,
+                    progress_tx,
+                    &mut thinking,
+                )
             } else {
                 execute_tool(&invocation, config)
             };
 
             send_tool_action(progress_tx, &invocation, Some(&result));
 
-            let result = result?;
+            let result = match result {
+                Ok(output) => output,
+                Err(message) => message,
+            };
 
             thinking.push_str("\n\n← ");
             thinking.push_str(&summarize_tool_result(&invocation.name, &result));
@@ -599,6 +626,90 @@ fn request_command_approval(
     response_rx
         .recv()
         .map_err(|_| "Command approval channel closed.".to_string())?
+}
+
+fn execute_file_tool_with_permission(
+    invocation: &ToolInvocation,
+    config: &LlmConfig,
+    permissions: &SharedPathPermissions,
+    progress_tx: &Sender<ChatProgressEvent>,
+    thinking: &mut String,
+) -> Result<String, String> {
+    let target = tool_target_path(invocation)?;
+    let access = file_access_for_tool(&invocation.name)
+        .ok_or_else(|| format!("Unknown file tool: {}", invocation.name))?;
+
+    loop {
+        let check = permissions
+            .lock()
+            .map_err(|_| "Could not read file permission state.".to_string())
+            .map(|state| check_path_permission(&target, &state))?;
+
+        match check {
+            PermissionCheck::Allowed => return execute_tool(invocation, config),
+            PermissionCheck::Denied => {
+                let directory = permission_directory_for_target(&target);
+                return Ok(format!(
+                    "Access denied: file access was rejected for {}.",
+                    directory.display()
+                ));
+            }
+            PermissionCheck::NeedsPrompt => {
+                let directory = permission_directory_for_target(&target);
+                let choice = request_file_permission(
+                    invocation,
+                    &directory,
+                    access,
+                    progress_tx,
+                    thinking,
+                )?;
+
+                let rule = choice.to_rule(&directory);
+                permissions
+                    .lock()
+                    .map_err(|_| "Could not update file permission state.".to_string())?
+                    .add_session_rule(rule);
+            }
+        }
+    }
+}
+
+fn request_file_permission(
+    invocation: &ToolInvocation,
+    directory: &std::path::Path,
+    access: FileAccess,
+    progress_tx: &Sender<ChatProgressEvent>,
+    thinking: &mut String,
+) -> Result<FilePermissionChoice, String> {
+    let arguments = format_tool_arguments(invocation);
+    let directory_display = directory.display().to_string();
+
+    thinking.push_str("\n\n→ Requesting permission to ");
+    thinking.push_str(access.label());
+    thinking.push_str(" files in ");
+    thinking.push_str(&directory_display);
+    thinking.push_str("\n\n⏸ Waiting for your decision…");
+    send_thinking(progress_tx, thinking);
+
+    let (response_tx, response_rx) = mpsc::channel();
+    progress_tx
+        .send(ChatProgressEvent::FilePermissionNeeded {
+            tool_name: invocation.name.clone(),
+            arguments,
+            directory: directory_display,
+            access,
+            response_tx,
+        })
+        .map_err(|_| "Could not request file permission.".to_string())?;
+
+    response_rx
+        .recv()
+        .map_err(|_| "File permission channel closed.".to_string())
+}
+
+fn tool_target_path(invocation: &ToolInvocation) -> Result<PathBuf, String> {
+    let path = path_from_arguments(&invocation.arguments)?;
+    Ok(permissions::normalize_path(&path))
 }
 
 fn command_from_arguments(arguments: &Value) -> Result<String, String> {
@@ -1084,22 +1195,36 @@ fn expand_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
+fn missing_path_error(kind: &str, path: &Path) -> String {
+    format!(
+        "{kind} does not exist: {}. Verify the path and try again — use ls on the parent directory if you need to find the correct name.",
+        path.display()
+    )
+}
+
+fn wrong_path_type_error(expected: &str, path: &Path) -> String {
+    format!(
+        "Path is not a {expected}: {}. Check the path and try again.",
+        path.display()
+    )
+}
+
 fn require_file_exists(path: &PathBuf) -> Result<(), String> {
     if !path.exists() {
-        return Err(format!("File does not exist: {}", path.display()));
+        return Err(missing_path_error("File", path));
     }
     if !path.is_file() {
-        return Err(format!("Not a file: {}", path.display()));
+        return Err(wrong_path_type_error("file", path));
     }
     Ok(())
 }
 
 fn require_directory_exists(path: &PathBuf) -> Result<(), String> {
     if !path.exists() {
-        return Err(format!("Directory does not exist: {}", path.display()));
+        return Err(missing_path_error("Directory", path));
     }
     if !path.is_dir() {
-        return Err(format!("Not a directory: {}", path.display()));
+        return Err(wrong_path_type_error("directory", path));
     }
     Ok(())
 }
@@ -1728,7 +1853,9 @@ mod tests {
     fn cat_errors_when_file_missing() {
         let result = cat(&json!({ "path": "/tmp/pairllm-definitely-missing-file" }));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("File does not exist"));
+        let err = result.unwrap_err();
+        assert!(err.contains("File does not exist"));
+        assert!(err.contains("try again"));
     }
 
     #[test]
@@ -1776,7 +1903,9 @@ mod tests {
             "expression": "s/old/new/"
         }));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("File does not exist"));
+        let err = result.unwrap_err();
+        assert!(err.contains("File does not exist"));
+        assert!(err.contains("try again"));
     }
 
     #[test]

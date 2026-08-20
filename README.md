@@ -58,7 +58,28 @@ Some tools are platform-specific. On Windows, `ls`, `cat`, and `sed` are omitted
 
 | `run_command` | Run a shell command (requires approval) | `{"tool":"run_command","command":"ls -la"}` |
 
-The app runs tools locally (or calls Tavily), sends the result back to the model, and then the model answers the user. **CLI commands are never run automatically** — you must approve them in a confirmation dialog first.
+The app runs tools locally (or calls Tavily), sends the result back to the model, and then the model answers the user. **Shell commands and file tool access require your approval** before they run.
+
+#### File access permissions
+
+`ls`, `cat`, and `sed` prompt inline in the chat the first time the assistant accesses a directory. Choose:
+
+- **Allow for this directory** — allow files in that directory only (not subdirectories)
+- **Allow recursively** — allow that directory and everything beneath it
+- **Reject** — block access for this session
+
+The prompt stays visible with your decision for the session. Use **Save for all sessions** to persist the rule to `settings.json`.
+
+Manage saved rules under **Settings → File access permissions**. When multiple rules match a path, the **most specific** path wins (e.g. allow `/home/you` but deny `/home/you/.ssh` blocks `.ssh`).
+
+Persistent rules are stored in `settings.json`:
+
+```json
+"path_permissions": [
+  { "path": "/home/you/projects", "permission": "allow_recursive" },
+  { "path": "/home/you/.ssh", "permission": "deny" }
+]
+```
 
 #### Tavily setup
 

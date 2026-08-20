@@ -1,9 +1,15 @@
 mod llm;
+mod permissions;
 mod settings;
 
 use chrono::{DateTime, Local};
 use eframe::egui;
 use llm::{ChatProgressEvent, ChatTrace, ChatTurn, LlmConfig, OllamaMetrics, ToolActionUpdate, QWEN_MODEL_OPTIONS, qwen_model_index};
+use permissions::{
+    FileAccess, FilePermissionChoice, PathPermission, PathPermissionRule, PathPermissionState,
+    SharedPathPermissions,
+};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -30,6 +36,21 @@ fn main() -> eframe::Result<()> {
 }
 
 #[derive(Clone)]
+enum PermissionPrompt {
+    Pending {
+        directory: String,
+        tool_name: String,
+        arguments: String,
+        access: FileAccess,
+    },
+    Resolved {
+        directory: String,
+        choice: FilePermissionChoice,
+        saved_persistent: bool,
+    },
+}
+
+#[derive(Clone)]
 struct Message {
     author: String,
     content: String,
@@ -39,11 +60,17 @@ struct Message {
     tool_success: Option<bool>,
     metrics: Option<OllamaMetrics>,
     trace: Option<ChatTrace>,
+    permission: Option<PermissionPrompt>,
 }
 
 struct CommandPrompt {
     command: String,
     response_tx: Sender<Result<String, String>>,
+}
+
+struct FilePermissionPrompt {
+    response_tx: Sender<FilePermissionChoice>,
+    message_index: usize,
 }
 
 enum LlmEvent {
@@ -53,6 +80,13 @@ enum LlmEvent {
     CommandApprovalNeeded {
         command: String,
         response_tx: Sender<Result<String, String>>,
+    },
+    FilePermissionNeeded {
+        tool_name: String,
+        arguments: String,
+        directory: String,
+        access: FileAccess,
+        response_tx: Sender<FilePermissionChoice>,
     },
     Reply {
         content: String,
@@ -74,6 +108,10 @@ struct ChatApp {
     thinking_message_index: Option<usize>,
     pending_tool_message_index: Option<usize>,
     command_prompt: Option<CommandPrompt>,
+    file_permission_prompt: Option<FilePermissionPrompt>,
+    path_permissions: SharedPathPermissions,
+    new_persistent_rule: String,
+    new_persistent_permission: PathPermission,
     llm_tx: Sender<LlmEvent>,
     llm_rx: Receiver<LlmEvent>,
     details_trace: Option<ChatTrace>,
@@ -82,18 +120,27 @@ struct ChatApp {
 impl ChatApp {
     fn new() -> Self {
         let (llm_tx, llm_rx) = mpsc::channel();
+        let llm = settings::load().unwrap_or_else(LlmConfig::default);
+        let path_permissions = Arc::new(Mutex::new(PathPermissionState {
+            persistent: llm.path_permissions.clone(),
+            session: Vec::new(),
+        }));
         let mut app = Self {
             messages: Vec::new(),
             draft: String::new(),
             status: None,
             scroll_to_bottom: false,
-            llm: settings::load().unwrap_or_else(LlmConfig::default),
+            llm: llm.clone(),
             show_settings: false,
             llm_status: "Checking for Ollama…".into(),
             llm_busy: false,
             thinking_message_index: None,
             pending_tool_message_index: None,
             command_prompt: None,
+            file_permission_prompt: None,
+            path_permissions,
+            new_persistent_rule: String::new(),
+            new_persistent_permission: PathPermission::AllowDirectory,
             llm_tx,
             llm_rx,
             details_trace: None,
@@ -103,6 +150,10 @@ impl ChatApp {
     }
 
     fn save_settings(&mut self, refresh_ollama: bool) {
+        if let Ok(mut state) = self.path_permissions.lock() {
+            state.sync_persistent(&self.llm.path_permissions);
+        }
+
         if let Err(err) = settings::save(&self.llm) {
             self.status = Some(err);
         }
@@ -150,6 +201,7 @@ impl ChatApp {
             tool_success: None,
             metrics: None,
             trace: None,
+            permission: None,
         });
 
         self.draft.clear();
@@ -174,6 +226,7 @@ impl ChatApp {
             tool_success: None,
             metrics: None,
             trace: None,
+            permission: None,
         });
         self.thinking_message_index = Some(self.messages.len() - 1);
         self.scroll_to_bottom = true;
@@ -181,6 +234,7 @@ impl ChatApp {
 
         let tx = self.llm_tx.clone();
         let config = self.llm.clone();
+        let permissions = Arc::clone(&self.path_permissions);
         let turns = self
             .messages
             .iter()
@@ -218,12 +272,27 @@ impl ChatApp {
                                 response_tx,
                             });
                         }
+                        ChatProgressEvent::FilePermissionNeeded {
+                            tool_name,
+                            arguments,
+                            directory,
+                            access,
+                            response_tx,
+                        } => {
+                            let _ = event_tx.send(LlmEvent::FilePermissionNeeded {
+                                tool_name,
+                                arguments,
+                                directory,
+                                access,
+                                response_tx,
+                            });
+                        }
                     }
                     progress_ctx.request_repaint();
                 }
             });
 
-            let result = llm::chat(&config, &turns, &progress_tx);
+            let result = llm::chat(&config, &turns, &progress_tx, &permissions);
             drop(progress_tx);
             progress_handle.join().ok();
 
@@ -262,6 +331,124 @@ impl ChatApp {
         }
     }
 
+    fn resolve_file_permission(&mut self, choice: FilePermissionChoice) {
+        let Some(prompt) = self.file_permission_prompt.take() else {
+            return;
+        };
+
+        if let Some(message) = self.messages.get_mut(prompt.message_index) {
+            if let Some(PermissionPrompt::Pending { directory, .. }) = message.permission.clone() {
+                message.permission = Some(PermissionPrompt::Resolved {
+                    directory,
+                    choice,
+                    saved_persistent: false,
+                });
+                message.created_at = Local::now();
+            }
+        }
+
+        let _ = prompt.response_tx.send(choice);
+    }
+
+    fn save_permission_for_all_sessions(&mut self, message_index: usize) {
+        let Some(PermissionPrompt::Resolved {
+            directory,
+            choice,
+            saved_persistent: false,
+            ..
+        }) = self.messages.get(message_index).and_then(|m| m.permission.clone())
+        else {
+            return;
+        };
+
+        let rule = choice.to_rule(std::path::Path::new(&directory));
+        self.llm.path_permissions.push(rule.clone());
+        if let Ok(mut state) = self.path_permissions.lock() {
+            state.add_persistent_rule(rule);
+        }
+        self.save_settings(false);
+
+        if let Some(message) = self.messages.get_mut(message_index) {
+            if let Some(PermissionPrompt::Resolved {
+                saved_persistent, ..
+            }) = message.permission.as_mut()
+            {
+                *saved_persistent = true;
+            }
+        }
+    }
+
+    fn add_persistent_permission_rule(&mut self) {
+        let path = self.new_persistent_rule.trim();
+        if path.is_empty() {
+            self.status = Some("Enter a directory path for the permission rule.".into());
+            return;
+        }
+
+        let rule = PathPermissionRule {
+            path: path.to_string(),
+            permission: self.new_persistent_permission.clone(),
+        };
+        self.llm.path_permissions.push(rule.clone());
+        if let Ok(mut state) = self.path_permissions.lock() {
+            state.add_persistent_rule(rule);
+        }
+        self.new_persistent_rule.clear();
+        self.save_settings(false);
+    }
+
+    fn remove_persistent_permission_rule(&mut self, index: usize) {
+        if index >= self.llm.path_permissions.len() {
+            return;
+        }
+
+        self.llm.path_permissions.remove(index);
+        if let Ok(mut state) = self.path_permissions.lock() {
+            state.sync_persistent(&self.llm.path_permissions);
+        }
+        self.save_settings(false);
+    }
+
+    fn push_file_permission_prompt(
+        &mut self,
+        tool_name: String,
+        arguments: String,
+        directory: String,
+        access: FileAccess,
+        response_tx: Sender<FilePermissionChoice>,
+    ) {
+        let insert_at = self.thinking_message_index.unwrap_or(self.messages.len());
+        self.messages.insert(
+            insert_at,
+            Message {
+                author: "File access".into(),
+                content: String::new(),
+                created_at: Local::now(),
+                is_thinking: false,
+                is_tool: false,
+                tool_success: None,
+                metrics: None,
+                trace: None,
+                permission: Some(PermissionPrompt::Pending {
+                    directory,
+                    tool_name,
+                    arguments,
+                    access,
+                }),
+            },
+        );
+        self.file_permission_prompt = Some(FilePermissionPrompt {
+            response_tx,
+            message_index: insert_at,
+        });
+
+        if let Some(thinking_index) = self.thinking_message_index {
+            self.thinking_message_index = Some(thinking_index + 1);
+        }
+
+        self.scroll_to_bottom = true;
+    }
+
     fn push_tool_action(&mut self, update: ToolActionUpdate) {
         if update.completed {
             if let Some(index) = self.pending_tool_message_index.take() {
@@ -286,6 +473,7 @@ impl ChatApp {
                 tool_success: None,
                 metrics: None,
                 trace: None,
+                permission: None,
             },
         );
         self.pending_tool_message_index = Some(insert_at);
@@ -341,6 +529,21 @@ impl ChatApp {
                         response_tx,
                     });
                 }
+                LlmEvent::FilePermissionNeeded {
+                    tool_name,
+                    arguments,
+                    directory,
+                    access,
+                    response_tx,
+                } => {
+                    self.push_file_permission_prompt(
+                        tool_name,
+                        arguments,
+                        directory,
+                        access,
+                        response_tx,
+                    );
+                }
                 LlmEvent::Reply {
                     content,
                     metrics,
@@ -366,6 +569,7 @@ impl ChatApp {
                             tool_success: None,
                             metrics: Some(metrics),
                             trace: Some(trace),
+                            permission: None,
                         });
                     }
                     self.pending_tool_message_index = None;
@@ -380,6 +584,7 @@ impl ChatApp {
                     }
                     self.pending_tool_message_index = None;
                     self.command_prompt = None;
+                    self.file_permission_prompt = None;
                     self.llm_status = message.clone();
                     self.status = Some(message);
                 }
@@ -509,6 +714,71 @@ impl eframe::App for ChatApp {
                     }
                 });
 
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("File access permissions").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Rules apply to ls, cat, and sed. The most specific matching path wins.",
+                    )
+                    .weak()
+                    .small(),
+                );
+
+                let mut remove_index: Option<usize> = None;
+                for (index, rule) in self.llm.path_permissions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.monospace(&rule.path);
+                        ui.label(
+                            egui::RichText::new(rule.permission.label())
+                                .weak()
+                                .small(),
+                        );
+                        if ui.small_button("Remove").clicked() {
+                            remove_index = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_index {
+                    self.remove_persistent_permission_rule(index);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Add rule");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.new_persistent_rule)
+                                .hint_text("/path/to/directory"),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                    egui::ComboBox::from_id_salt("new_path_permission")
+                        .selected_text(self.new_persistent_permission.label())
+                        .show_ui(ui, |ui| {
+                            for option in [
+                                PathPermission::AllowDirectory,
+                                PathPermission::AllowRecursive,
+                                PathPermission::Deny,
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        self.new_persistent_permission == option,
+                                        option.label(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.new_persistent_permission = option;
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+                    if ui.button("Add").clicked() {
+                        self.add_persistent_permission_rule();
+                        settings_changed = true;
+                    }
+                });
+
                 if settings_changed {
                     self.save_settings(ollama_changed);
                 }
@@ -516,7 +786,7 @@ impl eframe::App for ChatApp {
                 ui.label(
                     egui::RichText::new(
                         "Pull models with Ollama (e.g. `ollama pull qwen3:4b`), pick a size above, \
-                         then Refresh. CLI commands require your approval before running.",
+                         then Refresh. Shell commands and file tool access require your approval.",
                     )
                     .weak()
                     .small(),
@@ -529,7 +799,9 @@ impl eframe::App for ChatApp {
         egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
             ui.add_space(8.0);
 
-            let composer_enabled = !self.llm_busy && self.command_prompt.is_none();
+            let composer_enabled = !self.llm_busy
+                && self.command_prompt.is_none()
+                && self.file_permission_prompt.is_none();
 
             ui.horizontal(|ui| {
                 let response = ui.add_enabled(
@@ -586,11 +858,14 @@ impl eframe::App for ChatApp {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
                     let mut open_details: Option<ChatTrace> = None;
+                    let mut permission_choice: Option<FilePermissionChoice> = None;
+                    let mut save_permission_index: Option<usize> = None;
 
-                    for message in &self.messages {
+                    for (index, message) in self.messages.iter().enumerate() {
                         let is_user = message.author == USER_NAME;
                         let is_assistant = message.author == ASSISTANT_NAME;
                         let is_tool = message.is_tool;
+                        let is_permission = message.permission.is_some();
 
                         ui.horizontal(|ui| {
                             if is_user {
@@ -609,7 +884,9 @@ impl eframe::App for ChatApp {
                                     ui.label(
                                         egui::RichText::new(author_label)
                                         .strong()
-                                        .color(if is_tool {
+                                        .color(if is_permission {
+                                            egui::Color32::from_rgb(196, 160, 255)
+                                        } else if is_tool {
                                             egui::Color32::from_rgb(255, 196, 96)
                                         } else if is_assistant {
                                             egui::Color32::from_rgb(120, 214, 143)
@@ -629,6 +906,8 @@ impl eframe::App for ChatApp {
                                 let frame = egui::Frame::new()
                                     .fill(if is_user {
                                         egui::Color32::from_rgb(36, 48, 74)
+                                    } else if is_permission {
+                                        egui::Color32::from_rgb(40, 32, 52)
                                     } else if is_tool {
                                         egui::Color32::from_rgb(44, 36, 24)
                                     } else if is_assistant {
@@ -638,7 +917,9 @@ impl eframe::App for ChatApp {
                                     })
                                     .stroke(egui::Stroke::new(
                                         1.0,
-                                        if is_tool {
+                                        if is_permission {
+                                            egui::Color32::from_rgb(196, 160, 255)
+                                        } else if is_tool {
                                             egui::Color32::from_rgb(255, 196, 96)
                                         } else {
                                             egui::Color32::from_rgb(42, 49, 64)
@@ -648,7 +929,97 @@ impl eframe::App for ChatApp {
                                     .corner_radius(8.0);
 
                                 frame.show(ui, |ui| {
-                                    if is_tool {
+                                    if let Some(permission) = &message.permission {
+                                        match permission {
+                                            PermissionPrompt::Pending {
+                                                directory,
+                                                tool_name,
+                                                arguments,
+                                                access,
+                                            } => {
+                                                ui.label(format!(
+                                                    "The assistant wants to {} files via `{tool_name}` in:",
+                                                    access.label()
+                                                ));
+                                                ui.label(
+                                                    egui::RichText::new(directory).monospace(),
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.label(
+                                                    egui::RichText::new(arguments)
+                                                        .monospace()
+                                                        .weak(),
+                                                );
+                                                ui.add_space(8.0);
+
+                                                let is_active = self
+                                                    .file_permission_prompt
+                                                    .as_ref()
+                                                    .is_some_and(|prompt| {
+                                                        prompt.message_index == index
+                                                    });
+
+                                                ui.horizontal(|ui| {
+                                                    ui.add_enabled_ui(is_active, |ui| {
+                                                        if ui
+                                                            .button("Allow for this directory")
+                                                            .clicked()
+                                                        {
+                                                            permission_choice =
+                                                                Some(FilePermissionChoice::AllowDirectory);
+                                                        }
+                                                        if ui.button("Allow recursively").clicked()
+                                                        {
+                                                            permission_choice = Some(
+                                                                FilePermissionChoice::AllowRecursive,
+                                                            );
+                                                        }
+                                                        if ui.button("Reject").clicked() {
+                                                            permission_choice =
+                                                                Some(FilePermissionChoice::Reject);
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                            PermissionPrompt::Resolved {
+                                                directory,
+                                                choice,
+                                                saved_persistent,
+                                            } => {
+                                                ui.label(format!(
+                                                    "The assistant requested access to `{directory}`"
+                                                ));
+                                                ui.add_space(6.0);
+                                                let status_color = match choice {
+                                                    FilePermissionChoice::Reject => {
+                                                        egui::Color32::from_rgb(255, 143, 143)
+                                                    }
+                                                    _ => egui::Color32::from_rgb(196, 220, 196),
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(choice.session_status())
+                                                        .color(status_color)
+                                                        .strong(),
+                                                );
+                                                if !saved_persistent {
+                                                    ui.add_space(8.0);
+                                                    if ui.button("Save for all sessions").clicked()
+                                                    {
+                                                        save_permission_index = Some(index);
+                                                    }
+                                                } else {
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "Saved for all sessions",
+                                                        )
+                                                        .weak()
+                                                        .small(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else if is_tool {
                                         if let Some((arguments, summary)) =
                                             message.content.split_once("\n\n")
                                         {
@@ -713,6 +1084,12 @@ impl eframe::App for ChatApp {
 
                     if let Some(trace) = open_details {
                         self.details_trace = Some(trace);
+                    }
+                    if let Some(choice) = permission_choice {
+                        self.resolve_file_permission(choice);
+                    }
+                    if let Some(index) = save_permission_index {
+                        self.save_permission_for_all_sessions(index);
                     }
                 });
         });
