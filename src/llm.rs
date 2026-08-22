@@ -621,6 +621,13 @@ fn request_command_approval(
 ) -> Result<String, String> {
     let command = command_from_arguments(&invocation.arguments)?;
 
+    if let Some(message) = run_command_redirect_message(&command) {
+        thinking.push_str("\n\n→ ");
+        thinking.push_str(&message);
+        send_thinking(progress_tx, thinking);
+        return Err(message);
+    }
+
     thinking.push_str("\n\n→ Requesting approval to run command:\n");
     thinking.push_str(&command);
     thinking.push_str("\n\n⏸ Waiting for your approval…");
@@ -734,6 +741,80 @@ fn command_from_arguments(arguments: &Value) -> Result<String, String> {
         .ok_or("run_command requires a non-empty \"command\" argument.".into())
 }
 
+fn tool_json_example(name: &str) -> Option<&'static str> {
+    TOOL_SPECS
+        .iter()
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.json_example)
+}
+
+fn format_tool_redirect_message(tool_name: &str) -> String {
+    let example = tool_json_example(tool_name).unwrap_or("");
+    format!("Use the `{tool_name}` tool instead of run_command. Example: {example}")
+}
+
+fn normalized_shell_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_compound_shell_command(command: &str) -> bool {
+    let command = command.trim();
+    command.contains(';') || command.contains("&&") || command.contains("||")
+}
+
+fn is_sed_inplace(command: &str) -> bool {
+    command.split_whitespace().any(|word| {
+        word == "-i" || (word.starts_with("-i") && word.len() > 2)
+    })
+}
+
+fn grep_targets_file(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.len() < 3 || parts.first() != Some(&"grep") {
+        return false;
+    }
+
+    if parts.iter().any(|word| matches!(*word, "-r" | "-R")) {
+        return false;
+    }
+
+    let mut non_flags = parts.iter().skip(1).filter(|word| !word.starts_with('-'));
+    non_flags.next();
+    non_flags.next().is_some()
+}
+
+fn run_command_redirect_message(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    if is_supported_tool("ps") {
+        const PS_LISTING: &str = "ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm";
+        if normalized_shell_command(command).contains(PS_LISTING) {
+            return Some(format_tool_redirect_message("ps"));
+        }
+    }
+
+    if is_compound_shell_command(command) || command.contains('|') {
+        return None;
+    }
+
+    let first = command.split_whitespace().next()?;
+
+    match first {
+        "ls" if is_supported_tool("ls") => Some(format_tool_redirect_message("ls")),
+        "cat" if is_supported_tool("cat") => Some(format_tool_redirect_message("cat")),
+        "grep" if is_supported_tool("cat") && grep_targets_file(command) => {
+            Some(format_tool_redirect_message("cat"))
+        }
+        "sed" if is_supported_tool("sed") && is_sed_inplace(command) => {
+            Some(format_tool_redirect_message("sed"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 fn run_shell(command: &str) -> Result<std::process::Output, String> {
     Command::new("sh")
@@ -806,7 +887,6 @@ fn format_tool_arguments(invocation: &ToolInvocation) -> String {
         "sed" => format_sed_arguments(&parsed),
         "ps" => format_ps_arguments(&parsed),
         "run_command" => command_from_arguments(&parsed)
-            .map(|command| format!("command: {command}"))
             .unwrap_or_else(|err| err),
         _ => serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| parsed.to_string()),
     }
@@ -885,59 +965,8 @@ fn append_tool_preview(thinking: &mut String, invocation: &ToolInvocation) {
                 thinking.push_str(&format!(" ({query})"));
             }
         }
-        "ls" => {
-            if let Ok(path) = path_from_arguments(&invocation.arguments) {
-                let flags = invocation
-                    .arguments
-                    .get("flags")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                thinking.push_str(&format!(" (ls {flags} {})", path.display()));
-            }
-        }
-        "cat" => {
-            if let Ok(path) = path_from_arguments(&invocation.arguments) {
-                let flags = invocation
-                    .arguments
-                    .get("flags")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if let Some(pattern) = grep_pattern_from_arguments(&invocation.arguments) {
-                    if flags.contains('n') {
-                        thinking.push_str(&format!(" (grep -n '{pattern}' {})", path.display()));
-                    } else {
-                        thinking.push_str(&format!(" (grep '{pattern}' {})", path.display()));
-                    }
-                } else if flags.contains('n') {
-                    thinking.push_str(&format!(" (cat -n {})", path.display()));
-                } else {
-                    thinking.push_str(&format!(" (cat {})", path.display()));
-                }
-            }
-        }
-        "sed" => {
-            if let (Ok(path), Ok(expression)) = (
-                path_from_arguments(&invocation.arguments),
-                sed_expression_from_arguments(&invocation.arguments),
-            ) {
-                thinking.push_str(&format!(
-                    " (sed -i '{expression}' {})",
-                    path.display()
-                ));
-            }
-        }
-        "ps" => {
-            let pattern = grep_pattern_from_arguments(&invocation.arguments);
-            let sort = sort_from_arguments(&invocation.arguments);
-            thinking.push_str(&format!(
-                " ({})",
-                format_ps_command(pattern.as_deref(), sort.as_deref())
-            ));
-        }
-        "run_command" => {
-            if let Ok(command) = command_from_arguments(&invocation.arguments) {
-                thinking.push_str(&format!("\n  `$ {command}`"));
-            }
+        "ls" | "cat" | "sed" | "ps" | "run_command" => {
+            thinking.push_str(&format!(" ({})", format_tool_arguments(invocation)));
         }
         _ => {}
     }
@@ -1338,13 +1367,7 @@ fn format_sed_arguments(arguments: &Value) -> String {
         path_from_arguments(arguments),
         sed_expression_from_arguments(arguments),
     ) {
-        (Ok(path), Ok(expression)) => {
-            format!(
-                "command: {}\nexpression: {expression}\npath: {}",
-                format_sed_command(&path, &expression),
-                path.display()
-            )
-        }
+        (Ok(path), Ok(expression)) => format_sed_command(&path, &expression),
         (Err(err), _) | (_, Err(err)) => err,
     }
 }
@@ -1400,19 +1423,7 @@ fn format_ls_arguments(arguments: &Value) -> String {
         path_from_arguments(&parsed),
         parse_ls_flags(parsed.get("flags").and_then(Value::as_str)),
     ) {
-        (Ok(path), Ok(flags)) => {
-            let mut lines = vec![format!(
-                "command: {}",
-                format_ls_command(&path, &flags)
-            )];
-            lines.push(format!("path: {}", path.display()));
-            if flags.is_empty() {
-                lines.push("flags: (none)".into());
-            } else {
-                lines.push(format!("flags: {flags}"));
-            }
-            lines.join("\n")
-        }
+        (Ok(path), Ok(flags)) => format_ls_command(&path, &flags),
         (Err(err), _) | (_, Err(err)) => err,
     }
 }
@@ -1566,21 +1577,7 @@ fn format_ps_arguments(arguments: &Value) -> String {
     let parsed = normalize_arguments(arguments);
     let pattern = grep_pattern_from_arguments(&parsed);
     let sort = sort_from_arguments(&parsed);
-    let mut lines = vec![format!(
-        "command: {}",
-        format_ps_command(pattern.as_deref(), sort.as_deref())
-    )];
-    if let Some(pattern) = pattern {
-        lines.push(format!("pattern: {pattern}"));
-    } else {
-        lines.push("pattern: (none)".into());
-    }
-    if let Some(sort) = sort {
-        lines.push(format!("sort: {sort}"));
-    } else {
-        lines.push("sort: (none)".into());
-    }
-    lines.join("\n")
+    format_ps_command(pattern.as_deref(), sort.as_deref())
 }
 
 fn ps(arguments: &Value) -> Result<String, String> {
@@ -1708,20 +1705,7 @@ fn format_cat_arguments(arguments: &Value) -> String {
     ) {
         (Ok(path), Ok(flags)) => {
             let pattern = grep_pattern_from_arguments(&parsed);
-            let mut lines = vec![format!(
-                "command: {}",
-                format_cat_command(&path, pattern.as_deref(), &flags)
-            )];
-            lines.push(format!("path: {}", path.display()));
-            if let Some(pattern) = pattern {
-                lines.push(format!("pattern: {pattern}"));
-            }
-            if flags.is_empty() {
-                lines.push("flags: (none)".into());
-            } else {
-                lines.push(format!("flags: {flags}"));
-            }
-            lines.join("\n")
+            format_cat_command(&path, pattern.as_deref(), &flags)
         }
         (Err(err), _) | (_, Err(err)) => err,
     }
@@ -2145,7 +2129,7 @@ mod tests {
             arguments: json!({ "path": "~/notes.txt" }),
         };
         let args = format_tool_arguments(&invocation);
-        assert!(args.starts_with("command: cat "));
+        assert!(args.starts_with("cat "));
         assert!(args.contains("notes.txt"));
     }
 
@@ -2378,6 +2362,51 @@ mod tests {
             invocation.arguments.get("query").and_then(Value::as_str),
             Some("rust egui")
         );
+    }
+
+    #[test]
+    fn redirects_run_command_to_ls_tool() {
+        let message = run_command_redirect_message("ls -la /tmp").expect("redirect");
+        assert!(message.contains("`ls`"));
+        assert!(message.contains(r#"{"tool":"ls""#));
+    }
+
+    #[test]
+    fn redirects_run_command_to_cat_tool() {
+        let message = run_command_redirect_message("cat README.md").expect("redirect");
+        assert!(message.contains("`cat`"));
+    }
+
+    #[test]
+    fn redirects_grep_on_file_to_cat_tool() {
+        let message = run_command_redirect_message("grep -n 'fn main' src/main.rs").expect("redirect");
+        assert!(message.contains("`cat`"));
+    }
+
+    #[test]
+    fn redirects_run_command_to_sed_tool() {
+        let message =
+            run_command_redirect_message("sed -i 's/old/new/' file.txt").expect("redirect");
+        assert!(message.contains("`sed`"));
+    }
+
+    #[test]
+    fn redirects_run_command_to_ps_tool() {
+        let message = run_command_redirect_message(
+            "ps -eo pid,ppid,user,stat,%cpu,%mem,rss,etime,comm --sort=-rss | grep nginx | head -n 30",
+        )
+        .expect("redirect");
+        assert!(message.contains("`ps`"));
+    }
+
+    #[test]
+    fn does_not_redirect_unrelated_run_command() {
+        assert!(run_command_redirect_message("echo hello").is_none());
+        assert!(run_command_redirect_message("grep -r pattern .").is_none());
+        assert!(run_command_redirect_message("grep pattern").is_none());
+        assert!(run_command_redirect_message("sed 's/a/b/' file").is_none());
+        assert!(run_command_redirect_message("ls -la && cat file").is_none());
+        assert!(run_command_redirect_message("ps aux | grep nginx").is_none());
     }
 
     #[test]
